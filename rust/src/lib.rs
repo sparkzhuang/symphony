@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod dashboard;
 pub mod orchestrator;
+pub mod prompt;
 pub mod server;
 pub mod ssh;
 pub mod tracker;
