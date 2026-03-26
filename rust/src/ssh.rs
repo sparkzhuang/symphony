@@ -31,14 +31,6 @@ pub enum ShellExecutionError {
     },
     #[error("ssh executable not found in PATH")]
     SshNotFound,
-    #[error("ssh command failed on `{host}` with status {status_code}")]
-    SshFailed {
-        host: String,
-        command: String,
-        status_code: i32,
-        stdout: String,
-        stderr: String,
-    },
 }
 
 impl ShellExecutionError {
@@ -46,8 +38,7 @@ impl ShellExecutionError {
         match self {
             Self::TimedOut { command, .. }
             | Self::LocalSpawn { command, .. }
-            | Self::SshSpawn { command, .. }
-            | Self::SshFailed { command, .. } => Some(command.as_str()),
+            | Self::SshSpawn { command, .. } => Some(command.as_str()),
             Self::SshNotFound => None,
         }
     }
@@ -101,19 +92,6 @@ pub async fn run_ssh_command(
         }
     })
     .await
-    .and_then(|output| {
-        if output.status_code == 0 {
-            Ok(output)
-        } else {
-            Err(ShellExecutionError::SshFailed {
-                host: host.to_owned(),
-                command: remote_command,
-                status_code: output.status_code,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
-    })
 }
 
 async fn execute_command<F>(
