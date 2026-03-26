@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use symphony_rust::ssh::{run_local_command, run_ssh_command, ShellExecutionError};
@@ -10,6 +11,15 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .as_nanos();
 
     std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+}
+
+fn ssh_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SSH_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    SSH_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("ssh env lock should succeed")
 }
 
 #[tokio::test]
@@ -50,6 +60,7 @@ async fn returns_timeout_errors_for_local_commands() {
 
 #[tokio::test]
 async fn ssh_commands_escape_single_quotes_for_remote_bash() {
+    let _guard = ssh_env_lock();
     let test_root = unique_temp_dir("symphony-rust-ssh-escape");
     let fake_bin_dir = test_root.join("bin");
     let fake_ssh = fake_bin_dir.join("ssh");
@@ -105,6 +116,7 @@ async fn ssh_commands_escape_single_quotes_for_remote_bash() {
 
 #[tokio::test]
 async fn ssh_commands_return_output_and_nonzero_exit_status() {
+    let _guard = ssh_env_lock();
     let test_root = unique_temp_dir("symphony-rust-ssh-fake");
     let fake_bin_dir = test_root.join("bin");
     let fake_ssh = fake_bin_dir.join("ssh");
