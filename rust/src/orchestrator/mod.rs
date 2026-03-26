@@ -223,6 +223,7 @@ impl Orchestrator {
                 command_tx: command_tx.clone(),
                 snapshot_tx,
                 running_tasks: HashMap::new(),
+                retry_tasks: retry::RetryTaskRegistry::default(),
                 next_timer_token: 0,
                 tick_token: None,
                 started_at: Instant::now(),
@@ -402,6 +403,7 @@ struct RuntimeActor {
     command_tx: mpsc::UnboundedSender<OrchestratorCommand>,
     snapshot_tx: watch::Sender<RuntimeSnapshot>,
     running_tasks: HashMap<IssueId, AgentTaskHandle>,
+    retry_tasks: retry::RetryTaskRegistry,
     next_timer_token: u64,
     tick_token: Option<u64>,
     started_at: Instant,
@@ -438,6 +440,7 @@ impl RuntimeActor {
                         }
                         OrchestratorCommand::Shutdown => {
                             self.shutdown_running_tasks();
+                            self.retry_tasks.abort_all();
                             self.publish_snapshot();
                             break;
                         }
@@ -712,6 +715,7 @@ impl RuntimeActor {
             return;
         }
 
+        let _ = self.retry_tasks.remove(issue_id);
         self.state.retry_attempts.remove(issue_id);
         self.state.claimed.remove(issue_id);
 
@@ -820,13 +824,14 @@ impl RuntimeActor {
         );
         let command_tx = self.command_tx.clone();
         let delay_ms = entry.due_at_ms.saturating_sub(self.now_millis());
-        tokio::spawn(async move {
+        let retry_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             let _ = command_tx.send(OrchestratorCommand::RetryFire {
                 issue_id,
                 token: timer_token,
             });
         });
+        let _ = self.retry_tasks.replace(entry.issue_id.clone(), retry_task);
     }
 
     fn stop_running_task(&mut self, issue_id: &IssueId) {

@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+
+use tokio::task::JoinHandle;
+
 use crate::types::{IssueId, IssueIdentifier, OrchestratorState, RetryEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,4 +48,62 @@ pub fn schedule_retry(state: &mut OrchestratorState, request: RetryScheduleReque
     state.claimed.insert(request.issue_id.clone());
     state.retry_attempts.insert(request.issue_id, entry.clone());
     entry
+}
+
+#[derive(Default)]
+pub struct RetryTaskRegistry {
+    tasks: HashMap<IssueId, JoinHandle<()>>,
+}
+
+impl RetryTaskRegistry {
+    pub fn replace(&mut self, issue_id: IssueId, task: JoinHandle<()>) -> Option<JoinHandle<()>> {
+        let previous = self.tasks.insert(issue_id, task);
+        if let Some(previous) = previous {
+            previous.abort();
+            return Some(previous);
+        }
+        None
+    }
+
+    pub fn remove(&mut self, issue_id: &IssueId) -> Option<JoinHandle<()>> {
+        self.tasks.remove(issue_id)
+    }
+
+    pub fn abort_all(&mut self) {
+        for (_, task) in self.tasks.drain() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::RetryTaskRegistry;
+    use crate::types::IssueId;
+
+    #[tokio::test]
+    async fn replacing_retry_task_aborts_previous_timer() {
+        let issue_id = IssueId::new("retry-task");
+        let mut registry = RetryTaskRegistry::default();
+        let first = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(registry.replace(issue_id.clone(), first).is_none());
+
+        let second = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let replaced = registry
+            .replace(issue_id.clone(), second)
+            .expect("previous timer should be returned");
+
+        let error = replaced
+            .await
+            .expect_err("replaced retry timer should be aborted");
+        assert!(error.is_cancelled());
+        assert!(registry.remove(&issue_id).is_some());
+    }
 }
