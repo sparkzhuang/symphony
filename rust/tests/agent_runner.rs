@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use symphony_rust::agent::{AgentRunner, AppServerEventKind};
+use symphony_rust::agent::{AgentRunner, AgentRunnerError, AppServerEventKind};
 use symphony_rust::config::{HooksConfig, TrackerConfig, WorkflowConfig};
 use symphony_rust::tracker::{Tracker, TrackerError, TrackerFuture};
 use symphony_rust::types::{Issue, IssueId, IssueIdentifier, WorkflowDefinition};
@@ -211,6 +211,7 @@ done
                     events.lock().expect("events mutex").push(event);
                 })
             }),
+            None,
         )
         .await
         .expect("runner should succeed");
@@ -303,13 +304,109 @@ done
     });
 
     let runner = AgentRunner::new(workflow, config, tracker).expect("runner should be created");
-    let result = runner.run(sample_issue(), None).await;
+    let result = runner.run(sample_issue(), None, None).await;
 
     assert!(result.is_err(), "runner should fail when refresh fails");
     assert_eq!(
         fs::read_to_string(&after_marker).expect("after marker"),
         "after"
     );
+
+    let pid = fs::read_to_string(&pid_file).expect("fake codex should record its pid");
+
+    let mut stopped = false;
+    for _ in 0..10 {
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(&pid)
+            .status()
+            .expect("kill -0 should run");
+        if !status.success() {
+            stopped = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        stopped,
+        "expected app-server process {pid} to be terminated"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runner_stops_active_session_when_shutdown_is_requested() {
+    let root = unique_path("agent-runner-shutdown");
+    let workspace_root = root.join("workspaces");
+    let pid_file = root.join("codex.pid");
+    let fake_codex = root.join("fake-codex.sh");
+    fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+
+    fs::write(
+        &fake_codex,
+        format!(
+            r#"#!/bin/sh
+printf '%s' "$$" > "{pid_file}"
+IFS= read -r _line
+printf '%s\n' '{{"id":1,"result":{{}}}}'
+IFS= read -r _line
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-shutdown"}}}}}}'
+IFS= read -r _line
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-shutdown"}}}}}}'
+while true; do
+  sleep 0.1
+done
+"#,
+            pid_file = pid_file.display()
+        ),
+    )
+    .expect("script should be written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake_codex)
+            .expect("metadata should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_codex, perms).expect("script should be executable");
+    }
+
+    let workflow = WorkflowDefinition::new(
+        serde_json::json!({}),
+        "Issue {{ issue.identifier }}: {{ issue.title }}",
+    );
+    let mut config =
+        WorkflowConfig::from_value(serde_json::json!({})).expect("config should parse");
+    config.workspace.root = workspace_root.clone();
+    config.codex.command = fake_codex.display().to_string();
+    config.agent.max_turns = 1;
+    config.tracker = TrackerConfig {
+        kind: Some("linear".to_owned()),
+        api_key: Some("token".to_owned()),
+        ..TrackerConfig::default()
+    };
+
+    let tracker = Arc::new(ScriptedTracker {
+        issue: sample_issue(),
+        states: Arc::new(Mutex::new(vec!["In Progress".to_owned()])),
+    });
+
+    let runner = AgentRunner::new(workflow, config, tracker).expect("runner should be created");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task =
+        tokio::spawn(async move { runner.run(sample_issue(), None, Some(shutdown_rx)).await });
+
+    sleep(Duration::from_millis(200)).await;
+    shutdown_tx
+        .send(true)
+        .expect("shutdown signal should reach runner");
+
+    let error = task
+        .await
+        .expect("runner task should join")
+        .expect_err("runner should stop on shutdown");
+    assert!(matches!(error, AgentRunnerError::ShutdownRequested));
 
     let pid = fs::read_to_string(&pid_file).expect("fake codex should record its pid");
 

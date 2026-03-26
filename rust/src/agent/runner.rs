@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::agent::app_server::{AppServerClient, AppServerConfig, AppServerError, AppServerEvent};
 use crate::agent::tools::NonInteractiveDynamicToolExecutor;
@@ -56,6 +57,7 @@ impl AgentRunner {
         &self,
         mut issue: Issue,
         sink: Option<EventSink>,
+        mut shutdown: Option<watch::Receiver<bool>>,
     ) -> Result<AgentRunResult, AgentRunnerError> {
         let workspace = self
             .workspace_manager
@@ -89,11 +91,22 @@ impl AgentRunner {
                         continuation_guidance(turn_count + 1, self.config.agent.max_turns)
                     };
 
-                    client.run_turn(&mut session, &prompt, &issue).await?;
+                    tokio::select! {
+                        result = client.run_turn(&mut session, &prompt, &issue) => {
+                            result?;
+                        }
+                        _ = wait_for_shutdown_signal(&mut shutdown), if shutdown.is_some() => {
+                            return Err(AgentRunnerError::ShutdownRequested);
+                        }
+                    }
                     turn_count += 1;
 
                     if turn_count >= self.config.agent.max_turns {
                         break;
+                    }
+
+                    if shutdown_requested(&shutdown) {
+                        return Err(AgentRunnerError::ShutdownRequested);
                     }
 
                     let refreshed = self
@@ -145,6 +158,8 @@ pub enum AgentRunnerError {
     AppServer(#[from] AppServerError),
     #[error(transparent)]
     Tracker(#[from] TrackerError),
+    #[error("shutdown requested")]
+    ShutdownRequested,
 }
 
 fn workspace_hooks(config: &HooksConfig) -> crate::types::WorkspaceHooks {
@@ -169,4 +184,20 @@ fn continuation_guidance(turn_number: u32, max_turns: u32) -> String {
     format!(
         "Continuation guidance:\n\n- The previous Codex turn completed normally, but the Linear issue is still in an active state.\n- This is continuation turn #{turn_number} of {max_turns} for the current agent run.\n- Resume from the current workspace and workpad state instead of restarting from scratch.\n- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.\n- Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.\n"
     )
+}
+
+async fn wait_for_shutdown_signal(shutdown: &mut Option<watch::Receiver<bool>>) {
+    let Some(receiver) = shutdown.as_mut() else {
+        return;
+    };
+
+    if *receiver.borrow() {
+        return;
+    }
+
+    let _ = receiver.changed().await;
+}
+
+fn shutdown_requested(shutdown: &Option<watch::Receiver<bool>>) -> bool {
+    shutdown.as_ref().is_some_and(|receiver| *receiver.borrow())
 }
