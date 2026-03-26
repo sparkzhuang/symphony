@@ -145,14 +145,16 @@ pub struct ServiceConfig {
 /// Workspace hook configuration applied around workspace creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorkspaceHooks {
-    /// Hook run before workspace preparation begins.
-    pub before_create: Option<String>,
     /// Hook run after a workspace is created for the first time.
     pub after_create: Option<String>,
-    /// Hook run before an existing workspace is reused.
-    pub before_reuse: Option<String>,
-    /// Hook run before a workspace is deleted during terminal cleanup.
-    pub before_delete: Option<String>,
+    /// Hook run before each agent attempt after workspace preparation.
+    pub before_run: Option<String>,
+    /// Hook run after each agent attempt finishes.
+    pub after_run: Option<String>,
+    /// Hook run before workspace deletion during terminal cleanup.
+    pub before_remove: Option<String>,
+    /// Shared timeout applied to workspace hook execution in milliseconds.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Filesystem workspace assigned to one issue identifier.

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use symphony_rust::types::{
     BlockerRef, CodexTotals, Issue, IssueId, IssueIdentifier, LiveSession, OrchestratorState,
-    RetryEntry, RunAttempt, RunStatus, RunningEntry, WorkflowDefinition, Workspace,
+    RetryEntry, RunAttempt, RunStatus, RunningEntry, WorkflowDefinition, Workspace, WorkspaceHooks,
 };
 
 #[test]
@@ -105,4 +105,26 @@ fn core_types_round_trip_through_serde() {
     assert_eq!(decoded_state.max_concurrent_agents, 4);
     assert_eq!(decoded_state.running.len(), 1);
     assert_eq!(decoded_workflow.prompt_template, "# Prompt");
+}
+
+#[test]
+fn workspace_hooks_match_spec_field_names() {
+    let hooks = WorkspaceHooks {
+        after_create: Some("setup".to_owned()),
+        before_run: Some("prepare".to_owned()),
+        after_run: Some("cleanup".to_owned()),
+        before_remove: Some("rm".to_owned()),
+        timeout_ms: Some(60_000),
+    };
+
+    let encoded = serde_json::to_value(&hooks).expect("workspace hooks should serialize");
+
+    assert_eq!(encoded["after_create"], "setup");
+    assert_eq!(encoded["before_run"], "prepare");
+    assert_eq!(encoded["after_run"], "cleanup");
+    assert_eq!(encoded["before_remove"], "rm");
+    assert_eq!(encoded["timeout_ms"], 60_000);
+    assert!(encoded.get("before_create").is_none());
+    assert!(encoded.get("before_reuse").is_none());
+    assert!(encoded.get("before_delete").is_none());
 }
