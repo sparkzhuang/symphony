@@ -3,6 +3,7 @@ pub mod config;
 pub mod dashboard;
 pub mod orchestrator;
 pub mod server;
+pub mod ssh;
 pub mod tracker;
 pub mod types;
 pub mod workspace;
