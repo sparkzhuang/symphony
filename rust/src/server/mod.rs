@@ -199,8 +199,6 @@ pub struct HttpServer {
     local_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
-    refresh_rx: Option<mpsc::Receiver<()>>,
-    snapshot_tx: Option<watch::Sender<SnapshotState>>,
 }
 
 impl HttpServer {
@@ -229,8 +227,6 @@ impl HttpServer {
             local_addr,
             shutdown_tx: Some(shutdown_tx),
             task,
-            refresh_rx: None,
-            snapshot_tx: None,
         })
     }
 
@@ -247,9 +243,46 @@ impl HttpServer {
     }
 }
 
+pub struct RuntimeChannels {
+    snapshot_tx: watch::Sender<SnapshotState>,
+    refresh_rx: mpsc::Receiver<()>,
+}
+
+impl RuntimeChannels {
+    pub fn snapshot_sender(&self) -> &watch::Sender<SnapshotState> {
+        &self.snapshot_tx
+    }
+
+    pub fn refresh_receiver(&mut self) -> &mut mpsc::Receiver<()> {
+        &mut self.refresh_rx
+    }
+}
+
+pub fn runtime_channels(
+    refresh_buffer: usize,
+) -> (
+    RuntimeChannels,
+    watch::Receiver<SnapshotState>,
+    mpsc::Sender<()>,
+) {
+    let (snapshot_tx, snapshot_rx) = watch::channel(SnapshotState::Pending);
+    let (refresh_tx, refresh_rx) = mpsc::channel(refresh_buffer);
+
+    (
+        RuntimeChannels {
+            snapshot_tx,
+            refresh_rx,
+        },
+        snapshot_rx,
+        refresh_tx,
+    )
+}
+
 pub async fn bind_from_workflow(
     workflow_path: impl AsRef<Path>,
     cli_port: Option<u16>,
+    snapshot_rx: watch::Receiver<SnapshotState>,
+    refresh_tx: mpsc::Sender<()>,
 ) -> Result<Option<HttpServer>> {
     let workflow_path = workflow_path.as_ref();
     let workflow = WorkflowStore::load(workflow_path.to_path_buf())
@@ -260,16 +293,12 @@ pub async fn bind_from_workflow(
         return Ok(None);
     }
 
-    let (snapshot_tx, snapshot_rx) = watch::channel(SnapshotState::Pending);
-    let (refresh_tx, refresh_rx) = mpsc::channel(1);
-    let mut server = HttpServer::bind(
+    let server = HttpServer::bind(
         ServerOptions::new(snapshot_rx, refresh_tx)
             .with_cli_port(cli_port)
             .with_config_port(config_port),
     )
     .await?;
-    server.refresh_rx = Some(refresh_rx);
-    server.snapshot_tx = Some(snapshot_tx);
 
     Ok(Some(server))
 }
