@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -293,10 +293,9 @@ impl AppServerClient {
         session: &mut AppServerSession,
         mut outcome: TurnOutcome,
     ) -> Result<TurnOutcome, AppServerError> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.turn_timeout_ms);
         loop {
-            let message = self
-                .read_next_json(session, self.config.turn_timeout_ms)
-                .await?;
+            let message = self.read_next_turn_json(session, deadline).await?;
             let Some(method) = message.get("method").and_then(Value::as_str) else {
                 continue;
             };
@@ -345,23 +344,10 @@ impl AppServerClient {
                     emit(&session.sink, AppServerEventKind::ApprovalResolved, message);
                 }
                 "item/tool/requestUserInput" => {
-                    let answers = message
-                        .get("params")
-                        .and_then(|params| params.get("questions"))
-                        .and_then(Value::as_array)
-                        .map(|questions| {
-                            let mut answer_map = serde_json::Map::new();
-                            for question in questions {
-                                if let Some(id) = question.get("id").and_then(Value::as_str) {
-                                    answer_map.insert(
-                                        id.to_owned(),
-                                        json!({"answers": [NON_INTERACTIVE_ANSWER]}),
-                                    );
-                                }
-                            }
-                            Value::Object(answer_map)
-                        })
-                        .unwrap_or_else(|| json!({}));
+                    let answers = tool_input_answers(
+                        message.get("params"),
+                        approval_policy_is_never(self.config.approval_policy.as_ref()),
+                    );
 
                     self.send_json(
                         session,
@@ -412,6 +398,36 @@ impl AppServerClient {
                     }
                 }
                 _ => emit(&session.sink, AppServerEventKind::Notification, message),
+            }
+        }
+    }
+
+    async fn read_next_turn_json(
+        &mut self,
+        session: &mut AppServerSession,
+        deadline: Instant,
+    ) -> Result<Value, AppServerError> {
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(AppServerError::TurnTimeout(self.config.turn_timeout_ms));
+            };
+            let line = timeout(remaining, read_complete_line(session))
+                .await
+                .map_err(|_| AppServerError::TurnTimeout(self.config.turn_timeout_ms))??;
+            let Some(line) = line else {
+                return Err(AppServerError::PortExit);
+            };
+            if line.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<Value>(&line) {
+                Ok(value) => return Ok(value),
+                Err(_) => {
+                    if line.trim_start().starts_with('{') {
+                        emit(&session.sink, AppServerEventKind::Malformed, json!(line));
+                    }
+                }
             }
         }
     }
@@ -503,6 +519,8 @@ pub enum AppServerError {
     MissingPipe(&'static str),
     #[error("request/response timed out after {0} ms")]
     ResponseTimeout(u64),
+    #[error("turn timed out after {0} ms")]
+    TurnTimeout(u64),
     #[error("codex app-server exited unexpectedly")]
     PortExit,
     #[error("response returned error payload: {0}")]
@@ -581,6 +599,42 @@ fn emit(sink: &Option<EventSink>, kind: AppServerEventKind, payload: Value) {
 
 fn approval_policy_is_never(policy: Option<&Value>) -> bool {
     matches!(policy, Some(Value::String(value)) if value == "never")
+}
+
+fn tool_input_answers(params: Option<&Value>, auto_approve: bool) -> Value {
+    let Some(questions) = params
+        .and_then(|params| params.get("questions"))
+        .and_then(Value::as_array)
+    else {
+        return json!({});
+    };
+
+    let mut answers = serde_json::Map::new();
+    for question in questions {
+        let Some(id) = question.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let answer = if auto_approve {
+            tool_approval_answer(question).unwrap_or(NON_INTERACTIVE_ANSWER)
+        } else {
+            NON_INTERACTIVE_ANSWER
+        };
+        answers.insert(id.to_owned(), json!({ "answers": [answer] }));
+    }
+
+    Value::Object(answers)
+}
+
+fn tool_approval_answer(question: &Value) -> Option<&'static str> {
+    let options = question.get("options")?.as_array()?;
+    if options
+        .iter()
+        .any(|option| option.get("label").and_then(Value::as_str) == Some("Approve this Session"))
+    {
+        Some("Approve this Session")
+    } else {
+        None
+    }
 }
 
 fn absolute_workspace_path(workspace: &Path) -> Result<PathBuf, AppServerError> {

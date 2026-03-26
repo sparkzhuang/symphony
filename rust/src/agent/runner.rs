@@ -79,43 +79,51 @@ impl AgentRunner {
                 executor,
             );
             let mut session = client.start_session(&workspace.path, sink).await?;
-            let mut turn_count = 0_u32;
+            let result = async {
+                let mut turn_count = 0_u32;
 
-            loop {
-                let prompt = if turn_count == 0 {
-                    self.prompt_builder.render(&issue, None)?
-                } else {
-                    continuation_guidance(turn_count + 1, self.config.agent.max_turns)
-                };
+                loop {
+                    let prompt = if turn_count == 0 {
+                        self.prompt_builder.render(&issue, None)?
+                    } else {
+                        continuation_guidance(turn_count + 1, self.config.agent.max_turns)
+                    };
 
-                client.run_turn(&mut session, &prompt, &issue).await?;
-                turn_count += 1;
+                    client.run_turn(&mut session, &prompt, &issue).await?;
+                    turn_count += 1;
 
-                if turn_count >= self.config.agent.max_turns {
-                    break;
+                    if turn_count >= self.config.agent.max_turns {
+                        break;
+                    }
+
+                    let refreshed = self
+                        .tracker
+                        .fetch_issue_states_by_ids(&[issue.id.as_str().to_owned()])
+                        .await?;
+                    let Some(next_issue) = refreshed.into_iter().next() else {
+                        break;
+                    };
+
+                    if !active_state(&next_issue.state, &self.config.tracker) {
+                        break;
+                    }
+
+                    issue = next_issue;
                 }
 
-                let refreshed = self
-                    .tracker
-                    .fetch_issue_states_by_ids(&[issue.id.as_str().to_owned()])
-                    .await?;
-                let Some(next_issue) = refreshed.into_iter().next() else {
-                    break;
-                };
-
-                if !active_state(&next_issue.state, &self.config.tracker) {
-                    break;
-                }
-
-                issue = next_issue;
+                Ok(AgentRunResult {
+                    workspace: workspace.clone(),
+                    turn_count,
+                })
             }
+            .await;
 
-            client.stop_session(&mut session).await?;
-
-            Ok(AgentRunResult {
-                workspace: workspace.clone(),
-                turn_count,
-            })
+            let stop_result = client.stop_session(&mut session).await;
+            match (result, stop_result) {
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error.into()),
+                (Ok(result), Ok(())) => Ok(result),
+            }
         }
         .await;
 
