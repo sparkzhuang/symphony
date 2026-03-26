@@ -296,11 +296,13 @@ async fn maps_linear_error_categories() {
     let missing_key = LinearTracker::new(LinearTrackerConfig {
         api_key: None,
         ..linear_config()
-    });
+    })
+    .expect("tracker construction should succeed");
     let missing_slug = LinearTracker::new(LinearTrackerConfig {
         project_slug: None,
         ..linear_config()
-    });
+    })
+    .expect("tracker construction should succeed");
 
     let status_tracker = LinearTracker::with_executor(
         linear_config(),

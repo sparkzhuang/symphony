@@ -184,17 +184,17 @@ impl std::fmt::Debug for LinearTracker {
 }
 
 impl LinearTracker {
-    pub fn new(config: LinearTrackerConfig) -> Self {
+    pub fn new(config: LinearTrackerConfig) -> TrackerResult<Self> {
         let executor = ReqwestLinearGraphqlExecutor::new(
             config.endpoint.clone(),
             config.api_key.clone(),
             config.timeout,
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             config,
             executor: Arc::new(executor),
-        }
+        })
     }
 
     pub fn with_executor<E>(config: LinearTrackerConfig, executor: E) -> Self
@@ -487,17 +487,21 @@ struct ReqwestLinearGraphqlExecutor {
 }
 
 impl ReqwestLinearGraphqlExecutor {
-    fn new(endpoint: String, api_key: Option<String>, timeout: std::time::Duration) -> Self {
+    fn new(
+        endpoint: String,
+        api_key: Option<String>,
+        timeout: std::time::Duration,
+    ) -> TrackerResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .expect("reqwest client should build");
+            .map_err(|error| TrackerError::LinearApiRequest(error.to_string()))?;
 
-        Self {
+        Ok(Self {
             endpoint,
             api_key,
             client,
-        }
+        })
     }
 }
 
