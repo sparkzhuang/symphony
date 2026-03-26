@@ -82,7 +82,7 @@ fn adapts_running_event_width_to_terminal_columns() {
 }
 
 #[test]
-fn deduplicates_frames_and_flushes_pending_updates_after_render_interval() {
+fn flushes_pending_updates_after_render_interval_without_new_snapshot() {
     let now = Utc.with_ymd_and_hms(2026, 3, 26, 12, 0, 0).unwrap();
     let mut snapshot = sample_snapshot(now);
     let sink = RecordingSink::tty();
@@ -106,25 +106,46 @@ fn deduplicates_frames_and_flushes_pending_updates_after_render_interval() {
         )
         .expect("changed frame should be queued");
     let outcome_3 = dashboard
-        .render_snapshot(
-            &snapshot,
-            now + Duration::milliseconds(1_000),
-            now.timestamp_millis() as u64 + 1_000,
-        )
+        .flush_pending(now.timestamp_millis() as u64 + 1_000)
         .expect("queued frame should flush once interval elapses");
-    let outcome_4 = dashboard
-        .render_snapshot(
-            &snapshot,
-            now + Duration::milliseconds(1_000),
-            now.timestamp_millis() as u64 + 1_000,
-        )
-        .expect("duplicate frame should be skipped");
 
     assert_eq!(outcome_1, RenderOutcome::Rendered);
     assert_eq!(outcome_2, RenderOutcome::SkippedRateLimited);
     assert_eq!(outcome_3, RenderOutcome::Rendered);
-    assert_eq!(outcome_4, RenderOutcome::SkippedDuplicate);
     assert_eq!(dashboard.sink().frames.len(), 2);
+}
+
+#[test]
+fn flush_pending_returns_rate_limited_until_interval_elapses() {
+    let now = Utc.with_ymd_and_hms(2026, 3, 26, 12, 0, 0).unwrap();
+    let mut snapshot = sample_snapshot(now);
+    let sink = RecordingSink::tty();
+    let config = TerminalDashboardConfig {
+        render_interval_ms: 1_000,
+        terminal_columns_override: Some(115),
+        ..TerminalDashboardConfig::default()
+    };
+    let mut dashboard = TerminalDashboard::new(config, sink);
+
+    dashboard
+        .render_snapshot(&snapshot, now, now.timestamp_millis() as u64)
+        .expect("first render should succeed");
+
+    snapshot.codex_totals.total_tokens += 500;
+    dashboard
+        .render_snapshot(
+            &snapshot,
+            now + Duration::milliseconds(100),
+            now.timestamp_millis() as u64 + 100,
+        )
+        .expect("changed frame should be queued");
+
+    let outcome = dashboard
+        .flush_pending(now.timestamp_millis() as u64 + 500)
+        .expect("early flush should not fail");
+
+    assert_eq!(outcome, RenderOutcome::SkippedRateLimited);
+    assert_eq!(dashboard.sink().frames.len(), 1);
 }
 
 #[test]

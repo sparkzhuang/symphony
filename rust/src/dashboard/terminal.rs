@@ -199,6 +199,12 @@ where
         self.pending_frame = None;
         Ok(RenderOutcome::Rendered)
     }
+
+    fn ready_to_render(&self, monotonic_now_ms: u64) -> bool {
+        self.last_rendered_at_ms
+            .map(|last| monotonic_now_ms.saturating_sub(last) >= self.config.render_interval_ms)
+            .unwrap_or(true)
+    }
 }
 
 impl<S> Dashboard for TerminalDashboard<S>
@@ -243,12 +249,7 @@ where
             return Ok(RenderOutcome::SkippedDuplicate);
         }
 
-        let ready_to_render = self
-            .last_rendered_at_ms
-            .map(|last| monotonic_now_ms.saturating_sub(last) >= self.config.render_interval_ms)
-            .unwrap_or(true);
-
-        if ready_to_render {
+        if self.ready_to_render(monotonic_now_ms) {
             return self.write_rendered_frame(fingerprint, content, monotonic_now_ms);
         }
 
@@ -266,6 +267,24 @@ where
             content,
         });
         Ok(RenderOutcome::SkippedRateLimited)
+    }
+
+    fn flush_pending(&mut self, monotonic_now_ms: u64) -> io::Result<RenderOutcome> {
+        if !self.is_enabled() {
+            self.pending_frame = None;
+            return Ok(RenderOutcome::Disabled);
+        }
+
+        if !self.ready_to_render(monotonic_now_ms) {
+            return Ok(RenderOutcome::SkippedRateLimited);
+        }
+
+        match self.pending_frame.clone() {
+            Some(pending) => {
+                self.write_rendered_frame(pending.fingerprint, pending.content, monotonic_now_ms)
+            }
+            None => Ok(RenderOutcome::SkippedDuplicate),
+        }
     }
 }
 

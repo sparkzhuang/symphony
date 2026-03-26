@@ -31,6 +31,9 @@ pub trait Dashboard {
         now: DateTime<Utc>,
         monotonic_now_ms: u64,
     ) -> io::Result<RenderOutcome>;
+
+    /// Flushes a previously queued frame once the render interval elapses.
+    fn flush_pending(&mut self, monotonic_now_ms: u64) -> io::Result<RenderOutcome>;
 }
 
 /// Output target used by dashboard renderers.
