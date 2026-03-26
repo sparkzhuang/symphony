@@ -53,6 +53,10 @@ async fn memory_tracker_filters_states_and_records_write_events() {
         issue("3", "SPA-3", "In Progress"),
     ]);
 
+    let candidates = tracker
+        .fetch_candidate_issues()
+        .await
+        .expect("memory tracker should filter active candidates");
     let by_state = tracker
         .fetch_issues_by_states(&["todo".to_owned(), "in progress".to_owned()])
         .await
@@ -71,6 +75,12 @@ async fn memory_tracker_filters_states_and_records_write_events() {
         .await
         .expect("state update should be recorded");
 
+    let mut candidate_ids = candidates
+        .iter()
+        .map(|issue| issue.id.as_str())
+        .collect::<Vec<_>>();
+    candidate_ids.sort_unstable();
+    assert_eq!(candidate_ids, vec!["1", "3"]);
     assert_eq!(by_state.len(), 2);
     assert_eq!(
         by_id

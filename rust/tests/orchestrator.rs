@@ -659,6 +659,83 @@ async fn runtime_tick_dispatches_issue_and_queues_continuation_retry() {
 }
 
 #[tokio::test]
+async fn retry_fire_cleans_up_issue_that_becomes_terminal_while_queued() {
+    let workspace_root = unique_temp_dir("orchestrator-terminal-retry");
+    let tracker = Arc::new(MemoryTracker::new(vec![issue(
+        "runtime-terminal-1",
+        "SPA-119",
+        "Todo",
+        Some(1),
+        Some(Utc::now()),
+    )]));
+    let executor = FakeExecutor::default();
+    let workflow = WorkflowDefinition::new(json!({}), "Implement the task");
+    let config = WorkflowConfig::from_value(json!({
+        "tracker": {
+            "kind": "linear",
+            "api_key": "token",
+            "project_slug": "SPA"
+        },
+        "polling": { "interval_ms": 20 },
+        "workspace": {
+            "root": workspace_root
+        }
+    }))
+    .expect("config should parse");
+
+    let handle = Orchestrator::new_with_workflow(workflow, config, tracker.clone())
+        .expect("orchestrator should build")
+        .with_executor(Arc::new(executor.clone()))
+        .spawn()
+        .expect("runtime should spawn");
+
+    wait_until("first issue dispatch", Duration::from_secs(2), || {
+        let executor = executor.clone();
+        async move { executor.started_identifiers().await.len() == 1 }
+    })
+    .await;
+
+    tokio::fs::create_dir_all(workspace_root.join("SPA-119"))
+        .await
+        .expect("workspace should exist before terminal cleanup");
+
+    executor.complete_success("runtime-terminal-1").await;
+
+    wait_until("continuation retry entry", Duration::from_secs(2), || {
+        let snapshot = handle.snapshot();
+        async move {
+            snapshot
+                .retrying
+                .iter()
+                .any(|entry| entry.issue_id == "runtime-terminal-1")
+        }
+    })
+    .await;
+
+    tracker
+        .update_issue_state("runtime-terminal-1", "Done")
+        .await
+        .expect("issue should become terminal");
+
+    wait_until("terminal retry cleanup", Duration::from_secs(3), || {
+        let snapshot = handle.snapshot();
+        let workspace_path = workspace_root.join("SPA-119");
+        async move {
+            !snapshot
+                .retrying
+                .iter()
+                .any(|entry| entry.issue_id == "runtime-terminal-1")
+                && !tokio::fs::try_exists(workspace_path)
+                    .await
+                    .expect("workspace stat should succeed")
+        }
+    })
+    .await;
+
+    handle.shutdown().await.expect("shutdown should succeed");
+}
+
+#[tokio::test]
 async fn runtime_config_reload_applies_new_capacity_immediately() {
     let tracker = Arc::new(MemoryTracker::new(vec![
         issue("reload-1", "SPA-117", "Todo", Some(1), Some(Utc::now())),

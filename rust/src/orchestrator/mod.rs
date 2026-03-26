@@ -719,7 +719,11 @@ impl RuntimeActor {
         self.state.retry_attempts.remove(issue_id);
         self.state.claimed.remove(issue_id);
 
-        let issues = match self.tracker.fetch_candidate_issues().await {
+        let issues = match self
+            .tracker
+            .fetch_issue_states_by_ids(&[issue_id.as_str().to_owned()])
+            .await
+        {
             Ok(issues) => issues,
             Err(error) => {
                 self.schedule_retry_entry(
