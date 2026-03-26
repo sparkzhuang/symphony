@@ -220,7 +220,7 @@ impl WorkspaceManager {
             });
         }
 
-        let mut workspace = parse_remote_workspace_output(&output.output)?;
+        let mut workspace = parse_remote_workspace_output(&output.output, &workspace_path)?;
         workspace.workspace_key = workspace_key;
 
         if workspace.created_now {
@@ -253,11 +253,29 @@ impl WorkspaceManager {
 
     async fn remove_remote(&self, workspace: &Path, host: &str) -> Result<(), WorkspaceError> {
         validate_remote_workspace_path(workspace)?;
-        self.run_before_remove(workspace, Some(host)).await;
+        if let Some(command) = self.command_for_hook(HookName::BeforeRemove) {
+            let hook_script = remote_before_remove_script(workspace, command);
+            if let Err(error) = run_remote_command(
+                host,
+                &hook_script,
+                self.hook_timeout_ms(),
+                HookName::BeforeRemove,
+            )
+            .await
+            .and_then(|output| handle_hook_output(output, HookName::BeforeRemove))
+            {
+                warn!(
+                    workspace = %workspace.display(),
+                    worker_host = host,
+                    error = %error,
+                    "before_remove hook failed and was ignored"
+                );
+            }
+        }
 
         let script = format!(
-            "workspace={}\nrm -rf \"$workspace\"",
-            shell_escape(workspace)
+            "{}\nrm -rf \"$workspace\"",
+            remote_workspace_assignment(workspace)
         );
         let output = run_remote_command(
             host,
@@ -317,30 +335,39 @@ impl WorkspaceManager {
     }
 }
 
-pub fn parse_remote_workspace_output(output: &str) -> Result<Workspace, WorkspaceError> {
+pub fn parse_remote_workspace_output(
+    output: &str,
+    expected_workspace: &Path,
+) -> Result<Workspace, WorkspaceError> {
     let payload = output.lines().find_map(|line| {
-        let mut parts = line.splitn(3, '\t');
+        let mut parts = line.splitn(4, '\t');
         let marker = parts.next()?;
         let created = parts.next()?;
+        let root = parts.next()?;
         let path = parts.next()?;
 
-        if marker == REMOTE_WORKSPACE_MARKER && matches!(created, "0" | "1") && !path.is_empty() {
-            Some((created == "1", PathBuf::from(path)))
+        if marker == REMOTE_WORKSPACE_MARKER
+            && matches!(created, "0" | "1")
+            && !root.is_empty()
+            && !path.is_empty()
+        {
+            Some((created == "1", PathBuf::from(root), PathBuf::from(path)))
         } else {
             None
         }
     });
 
     match payload {
-        Some((created_now, path)) => Ok(Workspace {
-            workspace_key: workspace_key(
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("issue"),
-            ),
-            path,
-            created_now,
-        }),
+        Some((created_now, root, path)) => {
+            let workspace_key =
+                validate_remote_workspace_canonical_path(expected_workspace, &root, &path)?;
+
+            Ok(Workspace {
+                workspace_key,
+                path,
+                created_now,
+            })
+        }
         None => Err(WorkspaceError::InvalidRemoteWorkspaceOutput {
             output: output.to_owned(),
         }),
@@ -420,16 +447,78 @@ fn validate_remote_workspace_path(path: &Path) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
+fn validate_remote_workspace_canonical_path(
+    expected_workspace: &Path,
+    canonical_root: &Path,
+    canonical_workspace: &Path,
+) -> Result<WorkspaceKey, WorkspaceError> {
+    validate_remote_workspace_path(expected_workspace)?;
+    validate_remote_workspace_path(canonical_root)?;
+    validate_remote_workspace_path(canonical_workspace)?;
+
+    let expected_key = expected_workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| WorkspaceError::InvalidRemoteWorkspacePath {
+            path: expected_workspace.display().to_string(),
+            reason: "missing workspace key".to_owned(),
+        })?;
+    let actual_key = canonical_workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| WorkspaceError::InvalidRemoteWorkspacePath {
+            path: canonical_workspace.display().to_string(),
+            reason: "missing workspace key".to_owned(),
+        })?;
+
+    if canonical_workspace == canonical_root {
+        return Err(WorkspaceError::InvalidRemoteWorkspacePath {
+            path: canonical_workspace.display().to_string(),
+            reason: "workspace must not equal canonical root".to_owned(),
+        });
+    }
+
+    if actual_key != expected_key {
+        return Err(WorkspaceError::InvalidRemoteWorkspacePath {
+            path: canonical_workspace.display().to_string(),
+            reason: format!(
+                "workspace key mismatch: expected `{expected_key}`, got `{actual_key}`"
+            ),
+        });
+    }
+
+    if canonical_workspace.parent() != Some(canonical_root) {
+        return Err(WorkspaceError::InvalidRemoteWorkspacePath {
+            path: canonical_workspace.display().to_string(),
+            reason: format!(
+                "workspace is not a direct child of canonical root `{}`",
+                canonical_root.display()
+            ),
+        });
+    }
+
+    if let Some(expected_root) = expected_workspace.parent() {
+        if expected_root.is_absolute() && !canonical_workspace.starts_with(expected_root) {
+            return Err(WorkspaceError::InvalidRemoteWorkspacePath {
+                path: canonical_workspace.display().to_string(),
+                reason: format!(
+                    "workspace escaped requested root `{}`",
+                    expected_root.display()
+                ),
+            });
+        }
+    }
+
+    Ok(WorkspaceKey::new(actual_key))
+}
+
 fn remote_workspace_script(workspace: &Path) -> String {
     let mut script = String::new();
-    let escaped = shell_escape(workspace);
-
     script.push_str("set -eu\n");
-    script.push_str(&format!("workspace={escaped}\n"));
-    script.push_str("case \"$workspace\" in\n");
-    script.push_str("  '~') workspace=\"$HOME\" ;;\n");
-    script.push_str("  '~/'*) workspace=\"$HOME/${workspace#~/}\" ;;\n");
-    script.push_str("esac\n");
+    script.push_str(&remote_workspace_assignment(workspace));
+    script.push('\n');
     script.push_str("if [ -d \"$workspace\" ]; then\n");
     script.push_str("  created=0\n");
     script.push_str("elif [ -e \"$workspace\" ]; then\n");
@@ -441,11 +530,28 @@ fn remote_workspace_script(workspace: &Path) -> String {
     script.push_str("  created=1\n");
     script.push_str("fi\n");
     script.push_str("cd \"$workspace\"\n");
+    script.push_str("canonical_workspace=\"$(pwd -P)\"\n");
+    script.push_str("canonical_root=\"$(cd \"$(dirname \"$workspace\")\" && pwd -P)\"\n");
     script.push_str(&format!(
-        "printf '%s\\t%s\\t%s\\n' '{REMOTE_WORKSPACE_MARKER}' \"$created\" \"$(pwd -P)\"\n"
+        "printf '%s\\t%s\\t%s\\t%s\\n' '{REMOTE_WORKSPACE_MARKER}' \"$created\" \"$canonical_root\" \"$canonical_workspace\"\n"
     ));
 
     script
+}
+
+fn remote_before_remove_script(workspace: &Path, command: &str) -> String {
+    format!(
+        "{}\nif [ -d \"$workspace\" ]; then\n  cd \"$workspace\"\n  {}\nfi",
+        remote_workspace_assignment(workspace),
+        command
+    )
+}
+
+fn remote_workspace_assignment(workspace: &Path) -> String {
+    format!(
+        "workspace={}\ncase \"$workspace\" in\n  '~') workspace=\"$HOME\" ;;\n  '~/'*) workspace=\"$HOME/${{workspace#~/}}\" ;;\nesac",
+        shell_escape(workspace)
+    )
 }
 
 fn shell_escape(path: &Path) -> String {
@@ -454,4 +560,62 @@ fn shell_escape(path: &Path) -> String {
 
 fn shell_escape_raw(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn handle_hook_output(output: hooks::CommandOutput, hook: HookName) -> Result<(), WorkspaceError> {
+    if output.status == 0 {
+        return Ok(());
+    }
+
+    Err(WorkspaceError::HookFailed {
+        hook,
+        status: output.status,
+        output: output.output,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_remote_workspace_output, remote_before_remove_script, workspace_key, WorkspaceError,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn parses_remote_workspace_marker_line_when_path_matches_root_and_key() {
+        let output = "noise\n__SYMPHONY_WORKSPACE__\t1\t/tmp/remote\t/tmp/remote/workspace\n";
+
+        let parsed = parse_remote_workspace_output(output, Path::new("/tmp/remote/workspace"))
+            .expect("marker output should parse");
+
+        assert!(parsed.created_now);
+        assert_eq!(parsed.path, PathBuf::from("/tmp/remote/workspace"));
+        assert_eq!(parsed.workspace_key, workspace_key("workspace"));
+    }
+
+    #[test]
+    fn rejects_remote_workspace_marker_line_when_canonical_path_escapes_root() {
+        let output = "noise\n__SYMPHONY_WORKSPACE__\t1\t/tmp/remote\t/\n";
+
+        let error = parse_remote_workspace_output(output, Path::new("/tmp/remote/workspace"))
+            .expect_err("escaped canonical path should be rejected");
+
+        match error {
+            WorkspaceError::InvalidRemoteWorkspacePath { path, .. } => {
+                assert_eq!(path, "/");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_before_remove_script_guards_missing_directories() {
+        let script =
+            remote_before_remove_script(Path::new("/tmp/remote/workspace"), "echo cleanup");
+
+        assert!(script.contains("if [ -d \"$workspace\" ]; then"));
+        assert!(script.contains("  cd \"$workspace\""));
+        assert!(script.contains("  echo cleanup"));
+        assert!(script.contains("fi"));
+    }
 }

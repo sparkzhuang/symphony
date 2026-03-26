@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use symphony_rust::types::WorkspaceHooks;
-use symphony_rust::workspace::{
-    parse_remote_workspace_output, HookName, PathSafetyError, WorkspaceError, WorkspaceManager,
-};
+use symphony_rust::workspace::{HookName, PathSafetyError, WorkspaceError, WorkspaceManager};
 
 fn unique_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -208,16 +206,6 @@ async fn remove_issue_workspaces_removes_local_workspace() {
 
     assert!(!workspace.path.exists());
     let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn parses_remote_workspace_marker_line() {
-    let output = "noise\n__SYMPHONY_WORKSPACE__\t1\t/tmp/remote/workspace\n";
-
-    let parsed = parse_remote_workspace_output(output).expect("marker output should parse");
-
-    assert!(parsed.created_now);
-    assert_eq!(parsed.path, PathBuf::from("/tmp/remote/workspace"));
 }
 
 #[cfg(unix)]
