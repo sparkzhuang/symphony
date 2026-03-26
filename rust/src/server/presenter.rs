@@ -2,33 +2,35 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::RefreshQueued;
-use crate::types::{OrchestratorState, RetryEntry, RunningEntry};
+use super::{RefreshQueued, Snapshot};
+use crate::types::{RetryEntry, RunningEntry};
 
-pub fn state_payload(snapshot: &OrchestratorState, generated_at: DateTime<Utc>) -> StatePayload {
+pub fn state_payload(snapshot: &Snapshot, generated_at: DateTime<Utc>) -> StatePayload {
     StatePayload {
         generated_at: iso8601(generated_at),
         counts: StateCounts {
-            running: snapshot.running.len(),
-            retrying: snapshot.retry_attempts.len(),
+            running: snapshot.state.running.len(),
+            retrying: snapshot.state.retry_attempts.len(),
         },
         running: snapshot
+            .state
             .running
             .values()
             .map(running_entry_payload)
             .collect(),
         retrying: snapshot
+            .state
             .retry_attempts
             .values()
-            .map(|entry| retry_entry_payload(entry, generated_at))
+            .map(|entry| retry_entry_payload(entry, snapshot.monotonic_now_ms, generated_at))
             .collect(),
         codex_totals: CodexTotalsPayload {
-            input_tokens: snapshot.codex_totals.input_tokens,
-            output_tokens: snapshot.codex_totals.output_tokens,
-            total_tokens: snapshot.codex_totals.total_tokens,
-            seconds_running: snapshot.codex_totals.seconds_running,
+            input_tokens: snapshot.state.codex_totals.input_tokens,
+            output_tokens: snapshot.state.codex_totals.output_tokens,
+            total_tokens: snapshot.state.codex_totals.total_tokens,
+            seconds_running: snapshot.state.codex_totals.seconds_running,
         },
-        rate_limits: snapshot.codex_rate_limits.clone(),
+        rate_limits: snapshot.state.codex_rate_limits.clone(),
     }
 }
 
@@ -42,12 +44,18 @@ pub fn state_error_payload(code: &str, message: &str, generated_at: DateTime<Utc
     })
 }
 
-pub fn issue_payload(snapshot: &OrchestratorState, issue_identifier: &str) -> Option<IssuePayload> {
+pub fn issue_payload(
+    snapshot: &Snapshot,
+    issue_identifier: &str,
+    generated_at: DateTime<Utc>,
+) -> Option<IssuePayload> {
     let running = snapshot
+        .state
         .running
         .values()
         .find(|entry| entry.issue.identifier.as_str() == issue_identifier);
     let retry = snapshot
+        .state
         .retry_attempts
         .values()
         .find(|entry| entry.identifier.as_str() == issue_identifier);
@@ -81,7 +89,8 @@ pub fn issue_payload(snapshot: &OrchestratorState, issue_identifier: &str) -> Op
             current_retry_attempt: retry.map(|entry| entry.attempt).unwrap_or(0),
         },
         running: running.map(running_issue_payload),
-        retry: retry.map(|entry| retry_issue_payload(entry, Utc::now())),
+        retry: retry
+            .map(|entry| retry_issue_payload(entry, snapshot.monotonic_now_ms, generated_at)),
         logs: LogsPayload {
             codex_session_logs: Vec::new(),
         },
@@ -245,12 +254,16 @@ fn running_entry_payload(entry: &RunningEntry) -> RunningEntryPayload {
     }
 }
 
-fn retry_entry_payload(entry: &RetryEntry, generated_at: DateTime<Utc>) -> RetryEntryPayload {
+fn retry_entry_payload(
+    entry: &RetryEntry,
+    monotonic_now_ms: u64,
+    generated_at: DateTime<Utc>,
+) -> RetryEntryPayload {
     RetryEntryPayload {
         issue_id: entry.issue_id.as_str().to_owned(),
         issue_identifier: entry.identifier.as_str().to_owned(),
         attempt: entry.attempt,
-        due_at: due_at(entry, generated_at),
+        due_at: due_at(entry, monotonic_now_ms, generated_at),
         error: entry.error.clone(),
     }
 }
@@ -272,10 +285,14 @@ fn running_issue_payload(entry: &RunningEntry) -> RunningIssuePayload {
     }
 }
 
-fn retry_issue_payload(entry: &RetryEntry, generated_at: DateTime<Utc>) -> RetryIssuePayload {
+fn retry_issue_payload(
+    entry: &RetryEntry,
+    monotonic_now_ms: u64,
+    generated_at: DateTime<Utc>,
+) -> RetryIssuePayload {
     RetryIssuePayload {
         attempt: entry.attempt,
-        due_at: due_at(entry, generated_at),
+        due_at: due_at(entry, monotonic_now_ms, generated_at),
         error: entry.error.clone(),
     }
 }
@@ -330,8 +347,11 @@ fn token_payload(live_session: Option<&crate::types::LiveSession>) -> TokenPaylo
     }
 }
 
-fn due_at(entry: &RetryEntry, generated_at: DateTime<Utc>) -> String {
-    iso8601(generated_at + Duration::milliseconds(entry.due_at_ms as i64))
+fn due_at(entry: &RetryEntry, monotonic_now_ms: u64, generated_at: DateTime<Utc>) -> String {
+    let due_in_ms = entry.due_at_ms.saturating_sub(monotonic_now_ms);
+    let due_in_ms = i64::try_from(due_in_ms).unwrap_or(i64::MAX);
+
+    iso8601(generated_at + Duration::milliseconds(due_in_ms))
 }
 
 fn iso8601(timestamp: DateTime<Utc>) -> String {

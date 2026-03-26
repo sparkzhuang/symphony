@@ -4,14 +4,14 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use reqwest::StatusCode;
 use serde_json::Value;
-use symphony_rust::server::{HttpServer, ServerOptions, SnapshotState};
+use symphony_rust::server::{HttpServer, ServerOptions, Snapshot, SnapshotState};
 use symphony_rust::types::{
     CodexTotals, Issue, IssueId, IssueIdentifier, LiveSession, OrchestratorState, RetryEntry,
     RunAttempt, RunStatus, RunningEntry,
 };
 use tokio::sync::{mpsc, watch};
 
-fn sample_state() -> OrchestratorState {
+fn sample_state() -> Snapshot {
     let issue = Issue {
         id: IssueId::new("issue-1"),
         identifier: IssueIdentifier::new("SPA-17"),
@@ -54,7 +54,7 @@ fn sample_state() -> OrchestratorState {
     let retrying_issue_id = IssueId::new("issue-2");
     let retrying_identifier = IssueIdentifier::new("SPA-18");
 
-    OrchestratorState {
+    let state = OrchestratorState {
         poll_interval_ms: 30_000,
         max_concurrent_agents: 4,
         running: HashMap::from([(issue.id.clone(), running)]),
@@ -81,7 +81,13 @@ fn sample_state() -> OrchestratorState {
             "requests_remaining": 12,
             "tokens_remaining": 24_000
         })),
-    }
+    };
+
+    Snapshot::new(
+        state,
+        Utc.with_ymd_and_hms(2026, 3, 26, 10, 0, 0).unwrap(),
+        10_000,
+    )
 }
 
 async fn spawn_server(
@@ -157,6 +163,20 @@ async fn state_endpoint_returns_running_retrying_totals_and_rate_limits() {
     assert_eq!(payload["retrying"][0]["issue_identifier"], "SPA-18");
     assert_eq!(payload["codex_totals"]["total_tokens"], 7400);
     assert_eq!(payload["rate_limits"]["requests_remaining"], 12);
+    let generated_at = chrono::DateTime::parse_from_rfc3339(
+        payload["generated_at"]
+            .as_str()
+            .expect("generated_at should be a string"),
+    )
+    .expect("generated_at should be RFC3339");
+    let due_at = chrono::DateTime::parse_from_rfc3339(
+        payload["retrying"][0]["due_at"]
+            .as_str()
+            .expect("due_at should be a string"),
+    )
+    .expect("due_at should be RFC3339");
+
+    assert_eq!((due_at - generated_at).num_seconds(), 80);
 
     server.shutdown().await;
 }
@@ -179,6 +199,7 @@ async fn issue_endpoint_returns_detail_or_404() {
     assert_eq!(existing["issue_identifier"], "SPA-17");
     assert_eq!(existing["status"], "running");
     assert_eq!(existing["running"]["session_id"], "thread-1-turn-1");
+    assert_eq!(existing["retry"], Value::Null);
 
     let missing = reqwest::get(format!("http://{}/api/v1/SPA-404", server.local_addr()))
         .await

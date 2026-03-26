@@ -3,22 +3,46 @@ pub mod presenter;
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use tokio::net::{lookup_host, TcpListener};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::config::WorkflowStore;
 use crate::types::OrchestratorState;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub state: Box<OrchestratorState>,
+    pub observed_at: DateTime<Utc>,
+    pub monotonic_now_ms: u64,
+}
+
+impl Snapshot {
+    pub fn new(
+        state: OrchestratorState,
+        observed_at: DateTime<Utc>,
+        monotonic_now_ms: u64,
+    ) -> Self {
+        Self {
+            state: Box::new(state),
+            observed_at,
+            monotonic_now_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotState {
     Pending,
-    Ready(Box<OrchestratorState>),
+    Ready(Box<Snapshot>),
     Unavailable,
 }
 
@@ -120,10 +144,7 @@ impl SnapshotSource {
         Self { receiver }
     }
 
-    pub(crate) async fn snapshot(
-        &self,
-        timeout: Duration,
-    ) -> Result<OrchestratorState, SnapshotError> {
+    pub(crate) async fn snapshot(&self, timeout: Duration) -> Result<Snapshot, SnapshotError> {
         let mut receiver = self.receiver.clone();
 
         match receiver.borrow().clone() {
@@ -178,6 +199,8 @@ pub struct HttpServer {
     local_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
+    refresh_rx: Option<mpsc::Receiver<()>>,
+    snapshot_tx: Option<watch::Sender<SnapshotState>>,
 }
 
 impl HttpServer {
@@ -206,6 +229,8 @@ impl HttpServer {
             local_addr,
             shutdown_tx: Some(shutdown_tx),
             task,
+            refresh_rx: None,
+            snapshot_tx: None,
         })
     }
 
@@ -220,6 +245,33 @@ impl HttpServer {
 
         let _ = self.task.await;
     }
+}
+
+pub async fn bind_from_workflow(
+    workflow_path: impl AsRef<Path>,
+    cli_port: Option<u16>,
+) -> Result<Option<HttpServer>> {
+    let workflow_path = workflow_path.as_ref();
+    let workflow = WorkflowStore::load(workflow_path.to_path_buf())
+        .with_context(|| format!("failed to load workflow from {}", workflow_path.display()))?;
+    let config_port = workflow.current().config.server.port;
+
+    if cli_port.or(config_port).is_none() {
+        return Ok(None);
+    }
+
+    let (snapshot_tx, snapshot_rx) = watch::channel(SnapshotState::Pending);
+    let (refresh_tx, refresh_rx) = mpsc::channel(1);
+    let mut server = HttpServer::bind(
+        ServerOptions::new(snapshot_rx, refresh_tx)
+            .with_cli_port(cli_port)
+            .with_config_port(config_port),
+    )
+    .await?;
+    server.refresh_rx = Some(refresh_rx);
+    server.snapshot_tx = Some(snapshot_tx);
+
+    Ok(Some(server))
 }
 
 async fn resolve_bind_address(host: &str, port: u16) -> Result<SocketAddr> {

@@ -26,7 +26,10 @@ async fn healthz() -> impl IntoResponse {
 
 async fn state_snapshot(State(state): State<AppState>) -> Response {
     match state.snapshots.snapshot(state.snapshot_timeout).await {
-        Ok(snapshot) => Json(presenter::state_payload(&snapshot, Utc::now())).into_response(),
+        Ok(snapshot) => {
+            let now = Utc::now();
+            Json(presenter::state_payload(&snapshot, now)).into_response()
+        }
         Err(SnapshotError::Timeout) => Json(presenter::state_error_payload(
             "snapshot_timeout",
             "Snapshot timed out",
@@ -49,7 +52,7 @@ async fn issue_detail(
     Path(issue_identifier): Path<String>,
 ) -> Response {
     match state.snapshots.snapshot(state.snapshot_timeout).await {
-        Ok(snapshot) => match presenter::issue_payload(&snapshot, &issue_identifier) {
+        Ok(snapshot) => match presenter::issue_payload(&snapshot, &issue_identifier, Utc::now()) {
             Some(payload) => Json(payload).into_response(),
             None => (
                 StatusCode::NOT_FOUND,
