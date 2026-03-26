@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::anyhow;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
 use symphony_rust::config::WorkflowConfig;
@@ -10,14 +11,17 @@ use symphony_rust::orchestrator::{
     dispatch::{dispatch_sort_key, should_dispatch_issue, DispatchDecision},
     reconciliation::{reconcile_running, reconcile_stalled_runs, ReconciliationAction},
     retry::{calculate_retry_delay_ms, schedule_retry, RetryKind, RetryScheduleRequest},
-    Orchestrator, OrchestratorRuntimeConfig, RuntimeSnapshot,
+    AgentCompletion, AgentCompletionStatus, AgentExecutor, AgentTaskHandle, Orchestrator,
+    OrchestratorRuntimeConfig, RuntimeSnapshot,
 };
-use symphony_rust::tracker::memory::MemoryTracker;
+use symphony_rust::tracker::{memory::MemoryTracker, Tracker, TrackerError, TrackerFuture};
 use symphony_rust::types::{
     BlockerRef, CodexTotals, Issue, IssueId, IssueIdentifier, LiveSession, OrchestratorState,
-    RetryEntry, RunAttempt, RunStatus, RunningEntry,
+    RetryEntry, RunAttempt, RunStatus, RunningEntry, WorkflowDefinition,
 };
 use symphony_rust::workspace::WorkspaceManager;
+use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -88,6 +92,107 @@ fn state_with_running(running: HashMap<IssueId, RunningEntry>) -> OrchestratorSt
         completed: HashSet::new(),
         codex_totals: CodexTotals::default(),
         codex_rate_limits: Some(json!({"remaining": 42})),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FailingTerminalTracker;
+
+impl Tracker for FailingTerminalTracker {
+    fn fetch_candidate_issues(&self) -> TrackerFuture<'_, Vec<Issue>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn fetch_issues_by_states<'a>(
+        &'a self,
+        _state_names: &'a [String],
+    ) -> TrackerFuture<'a, Vec<Issue>> {
+        Box::pin(async { Err(TrackerError::LinearApiRequest("boom".to_owned())) })
+    }
+
+    fn fetch_issue_states_by_ids<'a>(
+        &'a self,
+        _issue_ids: &'a [String],
+    ) -> TrackerFuture<'a, Vec<Issue>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn create_comment<'a>(&'a self, _issue_id: &'a str, _body: &'a str) -> TrackerFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn update_issue_state<'a>(
+        &'a self,
+        _issue_id: &'a str,
+        _state_name: &'a str,
+    ) -> TrackerFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Clone, Default)]
+struct FakeExecutor {
+    inner: Arc<Mutex<FakeExecutorState>>,
+}
+
+#[derive(Default)]
+struct FakeExecutorState {
+    started: Vec<String>,
+    sinks: HashMap<String, Arc<dyn Fn(AgentCompletion) + Send + Sync>>,
+}
+
+impl FakeExecutor {
+    async fn started_identifiers(&self) -> Vec<String> {
+        self.inner.lock().await.started.clone()
+    }
+
+    async fn complete_success(&self, issue_id: &str) {
+        let sink = self.inner.lock().await.sinks.get(issue_id).cloned();
+        let Some(sink) = sink else {
+            panic!("missing completion sink for {issue_id}");
+        };
+        sink(AgentCompletion {
+            issue_id: IssueId::new(issue_id),
+            status: AgentCompletionStatus::Succeeded { turn_count: 1 },
+        });
+    }
+}
+
+impl AgentExecutor for FakeExecutor {
+    fn spawn(
+        &self,
+        issue: Issue,
+        _update_sink: Arc<dyn Fn(symphony_rust::agent::AppServerEvent) + Send + Sync>,
+        completion_sink: Arc<dyn Fn(AgentCompletion) + Send + Sync>,
+    ) -> anyhow::Result<AgentTaskHandle> {
+        let issue_id = issue.id.as_str().to_owned();
+        let issue_identifier = issue.identifier.as_str().to_owned();
+        let state = Arc::clone(&self.inner);
+
+        tokio::spawn(async move {
+            let mut guard = state.lock().await;
+            guard.started.push(issue_identifier);
+            guard.sinks.insert(issue_id, completion_sink);
+        });
+
+        Ok(AgentTaskHandle::new(Box::new(|| {})))
+    }
+}
+
+async fn wait_until<F, Fut>(description: &str, timeout: Duration, mut predicate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate().await {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {description}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -388,6 +493,40 @@ async fn startup_cleanup_removes_terminal_issue_workspaces() {
     );
 }
 
+#[tokio::test]
+async fn startup_cleanup_ignores_tracker_failures() {
+    let workspace_root = unique_temp_dir("orchestrator-startup-cleanup-failure");
+    tokio::fs::create_dir_all(workspace_root.join("SPA-115"))
+        .await
+        .expect("workspace should exist");
+
+    let config = WorkflowConfig::from_value(json!({
+        "tracker": {
+            "kind": "linear",
+            "api_key": "token",
+            "project_slug": "SPA",
+            "terminal_states": ["Done"]
+        },
+        "workspace": {
+            "root": workspace_root
+        }
+    }))
+    .expect("config should parse");
+
+    let orchestrator = Orchestrator::new(config, Arc::new(FailingTerminalTracker))
+        .expect("orchestrator should build");
+    orchestrator
+        .startup_cleanup_terminal_workspaces()
+        .await
+        .expect("startup cleanup should be best effort");
+
+    assert!(
+        tokio::fs::try_exists(orchestrator.workspace_root().join("SPA-115"))
+            .await
+            .expect("workspace stat should succeed")
+    );
+}
+
 #[test]
 fn snapshot_reports_running_retrying_totals_and_rate_limits() {
     let started_at = Utc::now() - ChronoDuration::seconds(5);
@@ -466,4 +605,124 @@ fn config_reload_updates_effective_runtime_limits_immediately() {
         runtime.max_concurrent_agents_by_state,
         HashMap::from([("in progress".to_owned(), 3_usize)])
     );
+}
+
+#[tokio::test]
+async fn runtime_tick_dispatches_issue_and_queues_continuation_retry() {
+    let tracker = Arc::new(MemoryTracker::new(vec![issue(
+        "runtime-1",
+        "SPA-116",
+        "Todo",
+        Some(1),
+        Some(Utc::now()),
+    )]));
+    let executor = FakeExecutor::default();
+    let workflow = WorkflowDefinition::new(json!({}), "Implement the task");
+    let config = WorkflowConfig::from_value(json!({
+        "tracker": {
+            "kind": "linear",
+            "api_key": "token",
+            "project_slug": "SPA"
+        },
+        "polling": { "interval_ms": 20 },
+        "workspace": {
+            "root": unique_temp_dir("orchestrator-runtime-dispatch")
+        }
+    }))
+    .expect("config should parse");
+
+    let handle = Orchestrator::new_with_workflow(workflow, config, tracker)
+        .expect("orchestrator should build")
+        .with_executor(Arc::new(executor.clone()))
+        .spawn()
+        .expect("runtime should spawn");
+
+    wait_until("first issue dispatch", Duration::from_secs(2), || {
+        let executor = executor.clone();
+        async move { executor.started_identifiers().await.len() == 1 }
+    })
+    .await;
+
+    executor.complete_success("runtime-1").await;
+
+    wait_until("continuation retry entry", Duration::from_secs(2), || {
+        let snapshot = handle.snapshot();
+        async move {
+            snapshot.retrying.iter().any(|entry| {
+                entry.issue_id == "runtime-1" && entry.attempt == 1 && entry.remaining_ms <= 1_000
+            })
+        }
+    })
+    .await;
+
+    handle.shutdown().await.expect("shutdown should succeed");
+}
+
+#[tokio::test]
+async fn runtime_config_reload_applies_new_capacity_immediately() {
+    let tracker = Arc::new(MemoryTracker::new(vec![
+        issue("reload-1", "SPA-117", "Todo", Some(1), Some(Utc::now())),
+        issue("reload-2", "SPA-118", "Todo", Some(2), Some(Utc::now())),
+    ]));
+    let executor = FakeExecutor::default();
+    let workflow = WorkflowDefinition::new(json!({}), "Implement the task");
+    let initial = WorkflowConfig::from_value(json!({
+        "tracker": {
+            "kind": "linear",
+            "api_key": "token",
+            "project_slug": "SPA"
+        },
+        "polling": { "interval_ms": 60000 },
+        "workspace": {
+            "root": unique_temp_dir("orchestrator-runtime-reload")
+        },
+        "agent": {
+            "max_concurrent_agents": 1
+        }
+    }))
+    .expect("initial config should parse");
+    let updated = WorkflowConfig::from_value(json!({
+        "tracker": {
+            "kind": "linear",
+            "api_key": "token",
+            "project_slug": "SPA"
+        },
+        "polling": { "interval_ms": 60000 },
+        "workspace": {
+            "root": unique_temp_dir("orchestrator-runtime-reload")
+        },
+        "agent": {
+            "max_concurrent_agents": 2
+        }
+    }))
+    .expect("updated config should parse");
+
+    let handle = Orchestrator::new_with_workflow(workflow.clone(), initial, tracker)
+        .expect("orchestrator should build")
+        .with_executor(Arc::new(executor.clone()))
+        .spawn()
+        .expect("runtime should spawn");
+
+    wait_until("initial dispatch", Duration::from_secs(2), || {
+        let executor = executor.clone();
+        async move { executor.started_identifiers().await.len() == 1 }
+    })
+    .await;
+
+    handle
+        .reload_config(workflow, updated)
+        .map_err(|error| anyhow!("reload failed: {error}"))
+        .expect("reload should enqueue");
+
+    wait_until(
+        "second dispatch after reload",
+        Duration::from_secs(2),
+        || {
+            let executor = executor.clone();
+            async move { executor.started_identifiers().await.len() == 2 }
+        },
+    )
+    .await;
+
+    handle.shutdown().await.expect("shutdown should succeed");
 }
