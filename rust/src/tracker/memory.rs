@@ -8,6 +8,7 @@ use crate::types::Issue;
 pub struct MemoryTracker {
     issues: Arc<Mutex<HashMap<String, Issue>>>,
     events: Arc<Mutex<Vec<TrackerEvent>>>,
+    active_states: Arc<HashSet<String>>,
 }
 
 impl MemoryTracker {
@@ -20,6 +21,10 @@ impl MemoryTracker {
         Self {
             issues: Arc::new(Mutex::new(issues)),
             events: Arc::new(Mutex::new(Vec::new())),
+            active_states: Arc::new(normalize_state_set(&[
+                "Todo".to_owned(),
+                "In Progress".to_owned(),
+            ])),
         }
     }
 
@@ -39,7 +44,14 @@ impl Tracker for MemoryTracker {
                 .lock()
                 .expect("memory tracker issues mutex should not be poisoned");
 
-            Ok(issues.values().cloned().collect())
+            Ok(issues
+                .values()
+                .filter(|issue| {
+                    self.active_states
+                        .contains(&issue.state.to_ascii_lowercase())
+                })
+                .cloned()
+                .collect())
         })
     }
 

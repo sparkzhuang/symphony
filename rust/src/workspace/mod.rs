@@ -54,6 +54,7 @@ pub enum WorkspaceError {
     CreateDirectory { path: PathBuf, source: io::Error },
 }
 
+#[derive(Debug)]
 pub struct WorkspaceManager {
     root: PathBuf,
     hooks: WorkspaceHooks,
@@ -76,6 +77,10 @@ impl WorkspaceManager {
     {
         self.ssh_hosts = hosts.into_iter().map(Into::into).collect();
         self
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub async fn create_for_issue(
