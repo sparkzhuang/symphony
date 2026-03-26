@@ -289,7 +289,6 @@ impl LinearTracker {
     async fn fetch_issue_states_by_id_batches(
         &self,
         issue_ids: &[String],
-        assignee_filter: Option<&str>,
     ) -> TrackerResult<Vec<Issue>> {
         let mut issues_by_id = HashMap::new();
 
@@ -312,7 +311,7 @@ impl LinearTracker {
 
             for issue in nodes
                 .iter()
-                .filter_map(|issue| normalize_issue(issue, assignee_filter))
+                .filter_map(|issue| normalize_issue(issue, None))
             {
                 issues_by_id.insert(issue.id.as_str().to_owned(), issue);
             }
@@ -401,9 +400,7 @@ impl Tracker for LinearTracker {
             }
 
             self.api_key()?;
-            let assignee_filter = self.resolve_assignee_filter().await?;
-            self.fetch_issue_states_by_id_batches(issue_ids, assignee_filter.as_deref())
-                .await
+            self.fetch_issue_states_by_id_batches(issue_ids).await
         })
     }
 

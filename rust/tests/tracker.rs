@@ -269,6 +269,35 @@ async fn fetch_issue_states_by_ids_batches_and_preserves_request_order() {
 }
 
 #[tokio::test]
+async fn fetch_issue_states_by_ids_keeps_reassigned_issues_in_results() {
+    let requests = Arc::new(Mutex::new(Vec::<GraphqlRequest>::new()));
+    let tracker = LinearTracker::with_executor(
+        LinearTrackerConfig {
+            assignee: AssigneeMode::Id("viewer-1".to_owned()),
+            ..linear_config()
+        },
+        MockLinearGraphqlExecutor::from_responses(
+            requests,
+            Arc::new(Mutex::new(VecDeque::from([Ok(json!({
+                "data": {
+                    "issues": {
+                        "nodes": [issue_node_with_assignee("id-1", "SPA-1", "In Progress", "someone-else")]
+                    }
+                }
+            }))]))),
+        ),
+    );
+
+    let issues = tracker
+        .fetch_issue_states_by_ids(&["id-1".to_owned()])
+        .await
+        .expect("issue-state refresh should succeed even when reassigned");
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].id.as_str(), "id-1");
+}
+
+#[tokio::test]
 async fn fetch_issues_by_states_skips_api_for_empty_state_filters() {
     let requests = Arc::new(Mutex::new(Vec::<GraphqlRequest>::new()));
     let tracker = LinearTracker::with_executor(
@@ -404,6 +433,24 @@ fn issue_node(id: &str, identifier: &str, state: &str) -> Value {
         "branchName": null,
         "url": null,
         "assignee": null,
+        "labels": { "nodes": [] },
+        "inverseRelations": { "nodes": [] },
+        "createdAt": "2026-03-26T12:00:00Z",
+        "updatedAt": "2026-03-26T13:00:00Z"
+    })
+}
+
+fn issue_node_with_assignee(id: &str, identifier: &str, state: &str, assignee_id: &str) -> Value {
+    json!({
+        "id": id,
+        "identifier": identifier,
+        "title": identifier,
+        "description": null,
+        "priority": 2.0,
+        "state": { "name": state },
+        "branchName": null,
+        "url": null,
+        "assignee": { "id": assignee_id },
         "labels": { "nodes": [] },
         "inverseRelations": { "nodes": [] },
         "createdAt": "2026-03-26T12:00:00Z",
