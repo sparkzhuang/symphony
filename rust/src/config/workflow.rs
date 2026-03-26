@@ -1,10 +1,11 @@
-use std::fs;
+use std::fs as stdfs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::fs;
 use tokio::time::{self, Duration};
 
 use crate::config::schema::{ConfigError, WorkflowConfig};
@@ -35,8 +36,8 @@ pub struct WorkflowStore {
 impl WorkflowStore {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, WorkflowError> {
         let path = path.into();
-        let snapshot = load_snapshot(&path)?;
-        let stamp = workflow_stamp(&path)?;
+        let snapshot = load_snapshot_sync(&path)?;
+        let stamp = workflow_stamp_sync(&path)?;
 
         Ok(Self {
             path,
@@ -50,12 +51,28 @@ impl WorkflowStore {
     }
 
     pub fn reload_if_changed(&mut self) -> Result<(), WorkflowError> {
-        let stamp = workflow_stamp(&self.path)?;
+        let stamp = workflow_stamp_sync(&self.path)?;
         if stamp == self.stamp {
             return Ok(());
         }
 
-        match load_snapshot(&self.path) {
+        match load_snapshot_sync(&self.path) {
+            Ok(snapshot) => {
+                self.stamp = stamp;
+                self.current = snapshot;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn reload_if_changed_async(&mut self) -> Result<(), WorkflowError> {
+        let stamp = workflow_stamp(&self.path).await?;
+        if stamp == self.stamp {
+            return Ok(());
+        }
+
+        match load_snapshot(&self.path).await {
             Ok(snapshot) => {
                 self.stamp = stamp;
                 self.current = snapshot;
@@ -71,7 +88,7 @@ impl WorkflowStore {
 
         loop {
             interval.tick().await;
-            if self.reload_if_changed().is_err() {
+            if self.reload_if_changed_async().await.is_err() {
                 continue;
             }
         }
@@ -109,8 +126,21 @@ pub enum WorkflowError {
     InvalidConfig(#[from] ConfigError),
 }
 
-fn load_snapshot(path: &Path) -> Result<WorkflowSnapshot, WorkflowError> {
-    let content = fs::read_to_string(path).map_err(|source| WorkflowError::MissingFile {
+async fn load_snapshot(path: &Path) -> Result<WorkflowSnapshot, WorkflowError> {
+    let content = fs::read_to_string(path)
+        .await
+        .map_err(|source| WorkflowError::MissingFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let workflow = parse_workflow(&content)?;
+    let config = WorkflowConfig::from_value(workflow.config.clone())?;
+
+    Ok(WorkflowSnapshot { workflow, config })
+}
+
+fn load_snapshot_sync(path: &Path) -> Result<WorkflowSnapshot, WorkflowError> {
+    let content = stdfs::read_to_string(path).map_err(|source| WorkflowError::MissingFile {
         path: path.to_path_buf(),
         source,
     })?;
@@ -120,8 +150,38 @@ fn load_snapshot(path: &Path) -> Result<WorkflowSnapshot, WorkflowError> {
     Ok(WorkflowSnapshot { workflow, config })
 }
 
-fn workflow_stamp(path: &Path) -> Result<WorkflowStamp, WorkflowError> {
-    let metadata = fs::metadata(path).map_err(|source| WorkflowError::MissingFile {
+async fn workflow_stamp(path: &Path) -> Result<WorkflowStamp, WorkflowError> {
+    let metadata = fs::metadata(path)
+        .await
+        .map_err(|source| WorkflowError::MissingFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let modified = metadata
+        .modified()
+        .map_err(|source| WorkflowError::MissingFile {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(source),
+        })?;
+    let content = fs::read(path)
+        .await
+        .map_err(|source| WorkflowError::MissingFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let digest = Sha256::digest(content);
+    let mut content_hash = [0_u8; 32];
+    content_hash.copy_from_slice(&digest);
+
+    Ok(WorkflowStamp {
+        modified,
+        size: metadata.len(),
+        content_hash,
+    })
+}
+
+fn workflow_stamp_sync(path: &Path) -> Result<WorkflowStamp, WorkflowError> {
+    let metadata = stdfs::metadata(path).map_err(|source| WorkflowError::MissingFile {
         path: path.to_path_buf(),
         source,
     })?;
@@ -131,7 +191,7 @@ fn workflow_stamp(path: &Path) -> Result<WorkflowStamp, WorkflowError> {
             path: path.to_path_buf(),
             source: std::io::Error::other(source),
         })?;
-    let content = fs::read(path).map_err(|source| WorkflowError::MissingFile {
+    let content = stdfs::read(path).map_err(|source| WorkflowError::MissingFile {
         path: path.to_path_buf(),
         source,
     })?;

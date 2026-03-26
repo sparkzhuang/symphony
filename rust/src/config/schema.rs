@@ -610,16 +610,26 @@ fn parse_state_limits(
 
     let mut limits = HashMap::new();
     for (state_name, raw_limit) in object {
-        let normalized = state_name.to_lowercase();
-        if normalized.trim().is_empty() {
+        let trimmed = state_name.trim();
+        let entry_path = format!("{path}.{state_name}");
+        if trimmed.is_empty() {
+            errors.push(ValidationError::new(entry_path, ConfigValueError::Required));
             continue;
         }
 
         match parse_integer(raw_limit) {
             Some(limit) if limit > 0 => {
+                let normalized = trimmed.to_lowercase();
                 limits.insert(normalized, limit as usize);
             }
-            _ => {}
+            Some(_) => errors.push(ValidationError::new(
+                entry_path,
+                ConfigValueError::MustBePositive,
+            )),
+            None => errors.push(ValidationError::new(
+                entry_path,
+                ConfigValueError::ExpectedInteger,
+            )),
         }
     }
 

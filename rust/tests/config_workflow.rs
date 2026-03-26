@@ -153,6 +153,37 @@ fn returns_structured_validation_errors() {
 }
 
 #[test]
+fn rejects_invalid_state_limit_entries() {
+    let error = WorkflowConfig::from_value(json!({
+        "agent": {
+            "max_concurrent_agents_by_state": {
+                "": 2,
+                "Todo": 0,
+                "In Progress": "abc"
+            }
+        }
+    }))
+    .expect_err("invalid state limits should fail validation");
+
+    match error {
+        ConfigError::InvalidConfig(errors) => {
+            assert!(errors.iter().any(|entry| {
+                entry.path == "agent.max_concurrent_agents_by_state."
+                    && matches!(entry.kind, ConfigValueError::Required)
+            }));
+            assert!(errors.iter().any(|entry| {
+                entry.path == "agent.max_concurrent_agents_by_state.Todo"
+                    && matches!(entry.kind, ConfigValueError::MustBePositive)
+            }));
+            assert!(errors.iter().any(|entry| {
+                entry.path == "agent.max_concurrent_agents_by_state.In Progress"
+                    && matches!(entry.kind, ConfigValueError::ExpectedInteger)
+            }));
+        }
+    }
+}
+
+#[test]
 fn validates_dispatch_preflight_requirements() {
     let old_linear_token = std::env::var_os("LINEAR_API_KEY");
     std::env::remove_var("LINEAR_API_KEY");
@@ -230,6 +261,47 @@ Second prompt
 
     assert_eq!(store.current().workflow.prompt_template, "Second prompt");
     assert_eq!(store.current().config.polling.interval_ms, 1500);
+
+    fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
+}
+
+#[tokio::test]
+async fn async_reload_keeps_last_good_snapshot_when_reload_fails() {
+    let temp_dir = unique_temp_dir("workflow-store-async");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let workflow_path = temp_dir.join("WORKFLOW.md");
+
+    write_workflow(
+        &workflow_path,
+        r#"---
+tracker:
+  kind: linear
+  api_key: literal-token
+  project_slug: SPA
+---
+Async prompt
+"#,
+    );
+
+    let mut store = WorkflowStore::load(&workflow_path).expect("initial workflow should load");
+    let initial = store.current().clone();
+
+    write_workflow(
+        &workflow_path,
+        r#"---
+tracker:
+  kind: linear
+  api_key: literal-token
+  project_slug: [broken
+---
+Broken async prompt
+"#,
+    );
+
+    let reload = store.reload_if_changed_async().await;
+
+    assert!(matches!(reload, Err(WorkflowError::Parse { .. })));
+    assert_eq!(store.current(), &initial);
 
     fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
 }
