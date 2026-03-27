@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::agent::protocol::{rate_limits_from_event, usage_from_event};
 use crate::agent::{AgentRunResult, AgentRunner, AppServerEvent, AppServerEventKind};
@@ -213,14 +213,16 @@ impl Orchestrator {
         };
         let (snapshot_tx, snapshot_rx) =
             watch::channel(RuntimeSnapshot::from_state(&state, now, 0));
-        let join_handle = tokio::spawn(
+        let (exit_tx, exit_rx) = mpsc::unbounded_channel();
+        let actor_command_tx = command_tx.clone();
+        let join_handle = tokio::spawn(async move {
             RuntimeActor {
                 tracker: Arc::clone(&self.tracker),
                 workspace_manager: self.workspace_manager,
                 runtime: self.runtime,
                 state,
                 command_rx,
-                command_tx: command_tx.clone(),
+                command_tx: actor_command_tx,
                 snapshot_tx,
                 running_tasks: HashMap::new(),
                 retry_tasks: retry::RetryTaskRegistry::default(),
@@ -230,12 +232,15 @@ impl Orchestrator {
                 executor,
                 executor_overridden: self.executor_overridden,
             }
-            .run(),
-        );
+            .run()
+            .await;
+            let _ = exit_tx.send(());
+        });
 
         Ok(OrchestratorHandle {
             command_tx,
             snapshot_rx,
+            exit_rx,
             join_handle: Some(join_handle),
         })
     }
@@ -284,6 +289,7 @@ impl AgentTaskHandle {
 pub struct OrchestratorHandle {
     command_tx: mpsc::UnboundedSender<OrchestratorCommand>,
     snapshot_rx: watch::Receiver<RuntimeSnapshot>,
+    exit_rx: mpsc::UnboundedReceiver<()>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -311,6 +317,15 @@ impl OrchestratorHandle {
             join_handle.await.context("orchestrator task join failed")?;
         }
         Ok(())
+    }
+
+    pub async fn wait_for_exit(&mut self) -> anyhow::Result<()> {
+        match self.exit_rx.recv().await {
+            Some(()) => Ok(()),
+            None => Err(anyhow::anyhow!(
+                "orchestrator task terminated without a clean exit signal"
+            )),
+        }
     }
 }
 
@@ -612,7 +627,7 @@ impl RuntimeActor {
                 issue,
                 run_attempt: RunAttempt {
                     issue_id: issue_id.clone(),
-                    issue_identifier,
+                    issue_identifier: issue_identifier.clone(),
                     attempt,
                     workspace_path,
                     started_at: Utc::now(),
@@ -622,6 +637,13 @@ impl RuntimeActor {
                 live_session: None,
                 worker_host: None,
             },
+        );
+        info!(
+            issue_id = issue_id.as_str(),
+            issue_identifier = issue_identifier.as_str(),
+            action = "dispatching",
+            attempt = attempt.unwrap_or(0),
+            "issue dispatch started"
         );
         self.running_tasks.insert(issue_id, task);
         Ok(())
@@ -673,6 +695,18 @@ impl RuntimeActor {
         if let Some(rate_limits) = rate_limits_from_event(&event.payload) {
             self.state.codex_rate_limits = Some(rate_limits);
         }
+
+        info!(
+            issue_id = entry.issue.id.as_str(),
+            issue_identifier = entry.issue.identifier.as_str(),
+            session_id = live_session.session_id.as_str(),
+            action = "updated",
+            event_kind = live_session
+                .last_codex_event
+                .as_deref()
+                .unwrap_or("unknown"),
+            "agent session event"
+        );
     }
 
     fn handle_agent_completed(&mut self, completion: AgentCompletion) {
@@ -685,6 +719,18 @@ impl RuntimeActor {
 
         match completion.status {
             AgentCompletionStatus::Succeeded { .. } => {
+                info!(
+                    issue_id = completion.issue_id.as_str(),
+                    issue_identifier = entry.issue.identifier.as_str(),
+                    session_id = entry
+                        .live_session
+                        .as_ref()
+                        .map(|session| session.session_id.as_str())
+                        .unwrap_or(""),
+                    action = "completed",
+                    outcome = "succeeded",
+                    "issue run completed"
+                );
                 self.state.completed.insert(completion.issue_id.clone());
                 self.schedule_retry_entry(
                     completion.issue_id,
@@ -695,6 +741,19 @@ impl RuntimeActor {
                 );
             }
             AgentCompletionStatus::Failed { error } => {
+                warn!(
+                    issue_id = completion.issue_id.as_str(),
+                    issue_identifier = entry.issue.identifier.as_str(),
+                    session_id = entry
+                        .live_session
+                        .as_ref()
+                        .map(|session| session.session_id.as_str())
+                        .unwrap_or(""),
+                    action = "completed",
+                    outcome = "failed",
+                    error = %error,
+                    "issue run failed"
+                );
                 self.schedule_retry_entry(
                     completion.issue_id,
                     entry.issue.identifier,
@@ -825,6 +884,16 @@ impl RuntimeActor {
                 max_retry_backoff_ms: self.runtime.max_retry_backoff_ms,
                 timer_token,
             },
+        );
+        info!(
+            issue_id = entry.issue_id.as_str(),
+            issue_identifier = entry.identifier.as_str(),
+            action = "retrying",
+            retry_kind = kind.as_str(),
+            attempt = entry.attempt,
+            due_at_ms = entry.due_at_ms,
+            error = entry.error.as_deref().unwrap_or(""),
+            "issue retry scheduled"
         );
         let command_tx = self.command_tx.clone();
         let delay_ms = entry.due_at_ms.saturating_sub(self.now_millis());

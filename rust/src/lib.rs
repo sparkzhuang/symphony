@@ -1,6 +1,8 @@
 pub mod agent;
+pub mod cli;
 pub mod config;
 pub mod dashboard;
+pub mod logging;
 pub mod orchestrator;
 pub mod prompt;
 pub mod server;
