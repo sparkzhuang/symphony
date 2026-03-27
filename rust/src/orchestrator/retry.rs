@@ -10,6 +10,15 @@ pub enum RetryKind {
     Failure,
 }
 
+impl RetryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continuation => "continuation",
+            Self::Failure => "failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryScheduleRequest {
     pub issue_id: IssueId,
