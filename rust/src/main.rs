@@ -1,6 +1,8 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -8,11 +10,20 @@ use symphony_rust::cli::Cli;
 use symphony_rust::config::{
     validate_dispatch_preflight, ValidationError, WorkflowConfig, WorkflowStore,
 };
+use symphony_rust::dashboard::terminal::{
+    StdoutDashboardSink, TerminalDashboard, TerminalDashboardConfig,
+};
+use symphony_rust::dashboard::Dashboard;
 use symphony_rust::logging::{init_logging, LoggingConfig};
-use symphony_rust::orchestrator::{Orchestrator, OrchestratorHandle};
+use symphony_rust::orchestrator::{Orchestrator, OrchestratorHandle, OrchestratorRefreshHandle};
+use symphony_rust::server::{HttpServer, ServerOptions, Snapshot, SnapshotState};
 use symphony_rust::tracker::linear::LinearTracker;
 use symphony_rust::tracker::{AssigneeMode, LinearTrackerConfig, Tracker, TrackerAdapter};
-use tracing::{error, info};
+use symphony_rust::types::{OrchestratorState, WorkflowDefinition};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, MissedTickBehavior};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -41,34 +52,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    require_guardrails_acknowledgement(&cli)?;
-
-    let workflow_path = cli.workflow_path();
-    let store = WorkflowStore::load(&workflow_path).with_context(|| {
-        format!(
-            "failed to load workflow definition from {}",
-            workflow_path.display()
-        )
-    })?;
-    let mut config = store.current().config.clone();
-    apply_cli_overrides(&mut config, &cli);
-    validate_startup_config(&config)?;
-
-    let tracker = build_tracker(&config)?;
-    let mut orchestrator = Orchestrator::new_with_workflow(
-        store.current().workflow.clone(),
-        config.clone(),
-        Arc::clone(&tracker),
-    )
-    .context("failed to build orchestrator")?
-    .spawn()
-    .context("failed to start orchestrator")?;
-
-    let headless = is_headless(config.server.port, io::stdout().is_terminal());
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let mut runtime = start_runtime(cli, stdout_is_terminal).await?;
     info!(
-        workflow_path = %workflow_path.display(),
-        port = config.server.port.unwrap_or_default(),
-        headless,
+        workflow_path = %runtime.workflow_path.display(),
+        port = runtime.port.unwrap_or_default(),
+        headless = runtime.headless,
         action = "started",
         "symphony host started"
     );
@@ -78,23 +67,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             signal?;
             info!(action = "shutdown", "shutdown signal received");
         }
-        result = orchestrator.wait_for_exit() => {
+        result = runtime.wait_for_exit() => {
             result?;
             bail!("orchestrator host exited unexpectedly");
         }
     }
 
-    shutdown(orchestrator).await
-}
-
-async fn shutdown(orchestrator: OrchestratorHandle) -> anyhow::Result<()> {
-    info!(action = "shutdown", "stopping orchestrator");
-    orchestrator
-        .shutdown()
-        .await
-        .context("failed to shut down orchestrator")?;
-    flush_stdio();
-    Ok(())
+    runtime.shutdown().await
 }
 
 fn require_guardrails_acknowledgement(cli: &Cli) -> anyhow::Result<()> {
@@ -163,6 +142,245 @@ fn is_headless(port: Option<u16>, stdout_is_terminal: bool) -> bool {
     port.is_none() && !stdout_is_terminal
 }
 
+struct AppRuntime {
+    workflow_path: PathBuf,
+    port: Option<u16>,
+    headless: bool,
+    dashboard_enabled: bool,
+    orchestrator: OrchestratorHandle,
+    server: Option<HttpServer>,
+    server_snapshot_task: Option<JoinHandle<()>>,
+    refresh_task: Option<JoinHandle<()>>,
+    dashboard_task: Option<JoinHandle<()>>,
+}
+
+impl AppRuntime {
+    #[cfg(test)]
+    fn server_addr(&self) -> Option<std::net::SocketAddr> {
+        self.server.as_ref().map(HttpServer::local_addr)
+    }
+
+    #[cfg(test)]
+    fn dashboard_enabled(&self) -> bool {
+        self.dashboard_enabled
+    }
+
+    async fn wait_for_exit(&mut self) -> anyhow::Result<()> {
+        self.orchestrator.wait_for_exit().await
+    }
+
+    async fn shutdown(mut self) -> anyhow::Result<()> {
+        info!(action = "shutdown", "stopping orchestrator");
+        self.orchestrator
+            .shutdown()
+            .await
+            .context("failed to shut down orchestrator")?;
+
+        if let Some(server) = self.server.take() {
+            server.shutdown().await;
+        }
+
+        join_optional_task(self.server_snapshot_task.take()).await;
+        join_optional_task(self.refresh_task.take()).await;
+        join_optional_task(self.dashboard_task.take()).await;
+        flush_stdio();
+        Ok(())
+    }
+}
+
+async fn start_runtime(cli: Cli, stdout_is_terminal: bool) -> anyhow::Result<AppRuntime> {
+    require_guardrails_acknowledgement(&cli)?;
+
+    let (workflow_path, workflow, config) = load_runtime_inputs(&cli)?;
+    let tracker = build_tracker(&config)?;
+    let orchestrator =
+        Orchestrator::new_with_workflow(workflow, config.clone(), Arc::clone(&tracker))
+            .context("failed to build orchestrator")?
+            .spawn()
+            .context("failed to start orchestrator")?;
+
+    let headless = is_headless(config.server.port, stdout_is_terminal);
+    let dashboard_enabled = !headless && stdout_is_terminal;
+
+    let mut runtime = AppRuntime {
+        workflow_path,
+        port: config.server.port,
+        headless,
+        dashboard_enabled,
+        orchestrator,
+        server: None,
+        server_snapshot_task: None,
+        refresh_task: None,
+        dashboard_task: None,
+    };
+
+    if let Err(error) = initialize_runtime_surfaces(&mut runtime, &config).await {
+        runtime.shutdown().await?;
+        return Err(error);
+    }
+
+    Ok(runtime)
+}
+
+fn load_runtime_inputs(cli: &Cli) -> anyhow::Result<(PathBuf, WorkflowDefinition, WorkflowConfig)> {
+    let workflow_path = cli.workflow_path();
+    let store = WorkflowStore::load(&workflow_path).with_context(|| {
+        format!(
+            "failed to load workflow definition from {}",
+            workflow_path.display()
+        )
+    })?;
+    let mut config = store.current().config.clone();
+    apply_cli_overrides(&mut config, cli);
+    validate_startup_config(&config)?;
+
+    Ok((workflow_path, store.current().workflow.clone(), config))
+}
+
+async fn initialize_runtime_surfaces(
+    runtime: &mut AppRuntime,
+    config: &WorkflowConfig,
+) -> anyhow::Result<()> {
+    if config.server.port.is_some() {
+        let (server, snapshot_task, refresh_task) =
+            start_http_server(config, &runtime.orchestrator)
+                .await
+                .context("failed to start HTTP server")?;
+        runtime.server = Some(server);
+        runtime.server_snapshot_task = Some(snapshot_task);
+        runtime.refresh_task = Some(refresh_task);
+    }
+
+    if runtime.dashboard_enabled {
+        runtime.dashboard_task = Some(tokio::spawn(run_dashboard(
+            runtime.orchestrator.subscribe_state(),
+        )));
+    }
+
+    Ok(())
+}
+
+async fn start_http_server(
+    config: &WorkflowConfig,
+    orchestrator: &OrchestratorHandle,
+) -> anyhow::Result<(HttpServer, JoinHandle<()>, JoinHandle<()>)> {
+    let initial_snapshot = SnapshotState::Ready(Box::new(Snapshot::new(
+        orchestrator.subscribe_state().borrow().clone(),
+        chrono::Utc::now(),
+        0,
+    )));
+    let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
+    let (refresh_tx, refresh_rx) = mpsc::channel(8);
+
+    let server = HttpServer::bind(
+        ServerOptions::new(snapshot_rx, refresh_tx)
+            .with_config_port(config.server.port)
+            .with_workspace_root(config.workspace.root.clone()),
+    )
+    .await?;
+
+    let snapshot_task = tokio::spawn(forward_server_snapshots(
+        orchestrator.subscribe_state(),
+        snapshot_tx,
+    ));
+    let refresh_task = tokio::spawn(forward_refresh_requests(
+        refresh_rx,
+        orchestrator.refresh_handle(),
+    ));
+
+    Ok((server, snapshot_task, refresh_task))
+}
+
+async fn forward_server_snapshots(
+    mut state_rx: watch::Receiver<OrchestratorState>,
+    snapshot_tx: watch::Sender<SnapshotState>,
+) {
+    let started_at = Instant::now();
+
+    loop {
+        let snapshot = SnapshotState::Ready(Box::new(Snapshot::new(
+            state_rx.borrow().clone(),
+            chrono::Utc::now(),
+            elapsed_millis(started_at),
+        )));
+        let _ = snapshot_tx.send(snapshot);
+
+        if state_rx.changed().await.is_err() {
+            let _ = snapshot_tx.send(SnapshotState::Unavailable);
+            break;
+        }
+    }
+}
+
+async fn forward_refresh_requests(
+    mut refresh_rx: mpsc::Receiver<()>,
+    refresh_handle: OrchestratorRefreshHandle,
+) {
+    while refresh_rx.recv().await.is_some() {
+        if let Err(error) = refresh_handle.request_refresh() {
+            warn!(error = %error, "failed to enqueue refresh request");
+            break;
+        }
+    }
+}
+
+async fn run_dashboard(state_rx: watch::Receiver<OrchestratorState>) {
+    let mut dashboard =
+        TerminalDashboard::new(TerminalDashboardConfig::default(), StdoutDashboardSink);
+    let started_at = Instant::now();
+    let mut state_rx = state_rx;
+    let _ = render_dashboard_snapshot(&mut dashboard, &state_rx.borrow().clone(), started_at);
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(
+        dashboard.config().refresh_interval_ms,
+    ));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            result = state_rx.changed() => {
+                if result.is_err() {
+                    break;
+                }
+
+                let snapshot = state_rx.borrow().clone();
+                let _ = render_dashboard_snapshot(&mut dashboard, &snapshot, started_at);
+            }
+            _ = ticker.tick() => {
+                let now_ms = elapsed_millis(started_at);
+                if let Err(error) = dashboard.flush_pending(now_ms) {
+                    warn!(error = %error, "failed to flush dashboard");
+                }
+            }
+        }
+    }
+}
+
+fn render_dashboard_snapshot(
+    dashboard: &mut TerminalDashboard<StdoutDashboardSink>,
+    snapshot: &OrchestratorState,
+    started_at: Instant,
+) -> io::Result<()> {
+    let now_ms = elapsed_millis(started_at);
+    dashboard
+        .render_snapshot(snapshot, chrono::Utc::now(), now_ms)
+        .map(|_| ())
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn join_optional_task(task: Option<JoinHandle<()>>) {
+    if let Some(task) = task {
+        match task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => warn!(error = %error, "background task exited unexpectedly"),
+        }
+    }
+}
+
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -192,9 +410,12 @@ fn flush_stdio() {
 mod tests {
     use super::{
         apply_cli_overrides, build_linear_tracker_config, format_validation_errors, is_headless,
-        require_guardrails_acknowledgement,
+        require_guardrails_acknowledgement, start_runtime,
     };
     use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use symphony_rust::cli::Cli;
     use symphony_rust::config::{ConfigValueError, ValidationError, WorkflowConfig};
     use symphony_rust::tracker::AssigneeMode;
@@ -258,7 +479,82 @@ mod tests {
         assert!(message.contains("tracker.api_key"));
     }
 
+    #[tokio::test]
+    async fn startup_path_starts_http_server_when_cli_port_is_set() {
+        let temp_dir = unique_temp_dir("main-startup-server");
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+        let workflow_path = temp_dir.join("WORKFLOW.md");
+        write_workflow(&workflow_path);
+
+        let cli = Cli {
+            workflow_path: workflow_path.clone(),
+            port: Some(0),
+            logs_root: None,
+            guardrails_acknowledged: true,
+        };
+
+        let runtime = start_runtime(cli, false)
+            .await
+            .expect("startup should succeed");
+
+        let server = runtime.server_addr().expect("server should be started");
+        let response = reqwest::get(format!("http://{server}/healthz"))
+            .await
+            .expect("health check should succeed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn startup_path_enables_terminal_surface_when_not_headless() {
+        let temp_dir = unique_temp_dir("main-startup-dashboard");
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+        let workflow_path = temp_dir.join("WORKFLOW.md");
+        write_workflow(&workflow_path);
+
+        let cli = Cli {
+            workflow_path,
+            port: None,
+            logs_root: None,
+            guardrails_acknowledged: true,
+        };
+
+        let runtime = start_runtime(cli, true)
+            .await
+            .expect("startup should succeed");
+
+        assert!(runtime.dashboard_enabled());
+        assert!(runtime.server_addr().is_none());
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+    }
+
     fn minimal_workflow_config() -> WorkflowConfig {
         WorkflowConfig::from_value(json!({})).expect("default config should parse")
+    }
+
+    fn write_workflow(path: &Path) {
+        fs::write(
+            path,
+            r#"---
+tracker:
+  kind: linear
+  api_key: literal-token
+  project_slug: SPA
+---
+Prompt
+"#,
+        )
+        .expect("workflow file should be written");
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 }

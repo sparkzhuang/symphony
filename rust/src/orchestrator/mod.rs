@@ -213,6 +213,7 @@ impl Orchestrator {
         };
         let (snapshot_tx, snapshot_rx) =
             watch::channel(RuntimeSnapshot::from_state(&state, now, 0));
+        let (state_tx, state_rx) = watch::channel(state.clone());
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
         let actor_command_tx = command_tx.clone();
         let join_handle = tokio::spawn(async move {
@@ -224,6 +225,7 @@ impl Orchestrator {
                 command_rx,
                 command_tx: actor_command_tx,
                 snapshot_tx,
+                state_tx,
                 running_tasks: HashMap::new(),
                 retry_tasks: retry::RetryTaskRegistry::default(),
                 next_timer_token: 0,
@@ -240,6 +242,7 @@ impl Orchestrator {
         Ok(OrchestratorHandle {
             command_tx,
             snapshot_rx,
+            state_rx,
             exit_rx,
             join_handle: Some(join_handle),
         })
@@ -289,8 +292,14 @@ impl AgentTaskHandle {
 pub struct OrchestratorHandle {
     command_tx: mpsc::UnboundedSender<OrchestratorCommand>,
     snapshot_rx: watch::Receiver<RuntimeSnapshot>,
+    state_rx: watch::Receiver<OrchestratorState>,
     exit_rx: mpsc::UnboundedReceiver<()>,
     join_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct OrchestratorRefreshHandle {
+    command_tx: mpsc::UnboundedSender<OrchestratorCommand>,
 }
 
 impl OrchestratorHandle {
@@ -311,6 +320,22 @@ impl OrchestratorHandle {
             .context("failed to enqueue config reload")
     }
 
+    pub fn subscribe_state(&self) -> watch::Receiver<OrchestratorState> {
+        self.state_rx.clone()
+    }
+
+    pub fn refresh_handle(&self) -> OrchestratorRefreshHandle {
+        OrchestratorRefreshHandle {
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    pub fn request_refresh(&self) -> anyhow::Result<()> {
+        self.command_tx
+            .send(OrchestratorCommand::Refresh)
+            .context("failed to enqueue orchestrator refresh")
+    }
+
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
         let _ = self.command_tx.send(OrchestratorCommand::Shutdown);
         if let Some(join_handle) = self.join_handle.take() {
@@ -326,6 +351,14 @@ impl OrchestratorHandle {
                 "orchestrator task terminated without a clean exit signal"
             )),
         }
+    }
+}
+
+impl OrchestratorRefreshHandle {
+    pub fn request_refresh(&self) -> anyhow::Result<()> {
+        self.command_tx
+            .send(OrchestratorCommand::Refresh)
+            .context("failed to enqueue orchestrator refresh")
     }
 }
 
@@ -393,6 +426,7 @@ enum OrchestratorCommand {
     Tick {
         token: u64,
     },
+    Refresh,
     AgentCompleted(AgentCompletion),
     AgentUpdate {
         issue_id: IssueId,
@@ -417,6 +451,7 @@ struct RuntimeActor {
     command_rx: mpsc::UnboundedReceiver<OrchestratorCommand>,
     command_tx: mpsc::UnboundedSender<OrchestratorCommand>,
     snapshot_tx: watch::Sender<RuntimeSnapshot>,
+    state_tx: watch::Sender<OrchestratorState>,
     running_tasks: HashMap<IssueId, AgentTaskHandle>,
     retry_tasks: retry::RetryTaskRegistry,
     next_timer_token: u64,
@@ -441,6 +476,7 @@ impl RuntimeActor {
 
                     match command {
                         OrchestratorCommand::Tick { token } => self.handle_tick(token).await,
+                        OrchestratorCommand::Refresh => self.schedule_tick(0),
                         OrchestratorCommand::AgentCompleted(completion) => {
                             self.handle_agent_completed(completion);
                         }
@@ -955,6 +991,7 @@ impl RuntimeActor {
             Utc::now(),
             self.now_millis(),
         ));
+        let _ = self.state_tx.send(self.state.clone());
     }
 
     fn next_token(&mut self) -> u64 {
