@@ -4,8 +4,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{TimeZone, Utc};
 use reqwest::StatusCode;
+use serde_json::json;
 use serde_json::Value;
-use symphony_rust::server::{bind_from_workflow, runtime_channels, Snapshot, SnapshotState};
+use symphony_rust::config::WorkflowConfig;
+use symphony_rust::server::{
+    bind_from_workflow, empty_snapshot, runtime_channels, Snapshot, SnapshotState,
+};
 use symphony_rust::types::{
     CodexTotals, Issue, IssueId, IssueIdentifier, OrchestratorState, RetryEntry, RunAttempt,
     RunStatus, RunningEntry,
@@ -241,4 +245,31 @@ Prompt
     assert_eq!(runtime.refresh_receiver().recv().await, Some(()));
 
     server.shutdown().await;
+}
+
+#[test]
+fn empty_snapshot_projects_runtime_defaults_from_workflow_config() {
+    let config = WorkflowConfig::from_value(json!({
+        "tracker": {
+            "kind": "linear",
+            "api_key": "literal-token",
+            "project_slug": "SPA"
+        },
+        "polling": {
+            "interval_ms": 45_000
+        },
+        "agent": {
+            "max_concurrent_agents": 6
+        }
+    }))
+    .expect("config should parse");
+
+    let snapshot = empty_snapshot(&config);
+
+    assert_eq!(snapshot.state.poll_interval_ms, 45_000);
+    assert_eq!(snapshot.state.max_concurrent_agents, 6);
+    assert!(snapshot.state.running.is_empty());
+    assert!(snapshot.state.retry_attempts.is_empty());
+    assert_eq!(snapshot.state.codex_totals, CodexTotals::default());
+    assert_eq!(snapshot.state.codex_rate_limits, None);
 }

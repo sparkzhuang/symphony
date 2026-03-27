@@ -98,7 +98,9 @@ async fn spawn_server(
     let (refresh_tx, refresh_rx) = mpsc::channel(1);
 
     let server = HttpServer::bind(
-        ServerOptions::new(snapshot_rx, refresh_tx).with_snapshot_timeout(snapshot_timeout),
+        ServerOptions::new(snapshot_rx, refresh_tx)
+            .with_workspace_root("/tmp/symphony_workspaces")
+            .with_snapshot_timeout(snapshot_timeout),
     )
     .await
     .expect("server should bind");
@@ -200,6 +202,23 @@ async fn issue_endpoint_returns_detail_or_404() {
     assert_eq!(existing["status"], "running");
     assert_eq!(existing["running"]["session_id"], "thread-1-turn-1");
     assert_eq!(existing["retry"], Value::Null);
+    assert_eq!(existing["workspace"]["path"], "/tmp/symphony/SPA-17");
+
+    let retrying = read_json(
+        reqwest::get(format!("http://{}/api/v1/SPA-18", server.local_addr()))
+            .await
+            .expect("retrying issue request should succeed"),
+    )
+    .await;
+
+    assert_eq!(retrying["issue_identifier"], "SPA-18");
+    assert_eq!(retrying["status"], "retrying");
+    assert_eq!(retrying["running"], Value::Null);
+    assert_eq!(retrying["retry"]["attempt"], 3);
+    assert_eq!(
+        retrying["workspace"]["path"],
+        "/tmp/symphony_workspaces/SPA-18"
+    );
 
     let missing = reqwest::get(format!("http://{}/api/v1/SPA-404", server.local_addr()))
         .await

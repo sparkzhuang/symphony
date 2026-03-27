@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use std::env;
 
+use symphony_rust::config::WorkflowStore;
 use symphony_rust::server::{self, SnapshotState};
 
 #[derive(Debug, Parser)]
@@ -26,22 +27,32 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let workflow_path = env::current_dir()?.join("WORKFLOW.md");
+    let workflow = WorkflowStore::load(workflow_path.clone())
+        .context("failed to load workflow for HTTP observability startup")?;
     let (mut runtime, snapshot_rx, refresh_tx) = server::runtime_channels(1);
 
     match server::bind_from_workflow(&workflow_path, cli.port, snapshot_rx, refresh_tx).await? {
         Some(server) => {
             let local_addr = server.local_addr();
             tracing::info!(%local_addr, "HTTP observability server listening");
+            let config = workflow.current().config.clone();
             runtime
                 .snapshot_sender()
-                .send(SnapshotState::Unavailable)
+                .send(SnapshotState::Ready(Box::new(server::empty_snapshot(
+                    &config,
+                ))))
                 .context("failed to publish initial HTTP snapshot state")?;
 
             let refresh_task = tokio::spawn(async move {
                 while runtime.refresh_receiver().recv().await.is_some() {
-                    tracing::warn!(
-                        "HTTP refresh requested before orchestrator integration is available"
-                    );
+                    let snapshot = server::empty_snapshot(&config);
+                    if runtime
+                        .snapshot_sender()
+                        .send(SnapshotState::Ready(Box::new(snapshot)))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             });
 

@@ -38,9 +38,10 @@ async fn state_snapshot(State(state): State<AppState>) -> Response {
         .into_response(),
         Err(SnapshotError::Unavailable) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(error_payload(
+            Json(presenter::state_error_payload(
                 "snapshot_unavailable",
                 "Snapshot unavailable",
+                Utc::now(),
             )),
         )
             .into_response(),
@@ -52,7 +53,12 @@ async fn issue_detail(
     Path(issue_identifier): Path<String>,
 ) -> Response {
     match state.snapshots.snapshot(state.snapshot_timeout).await {
-        Ok(snapshot) => match presenter::issue_payload(&snapshot, &issue_identifier, Utc::now()) {
+        Ok(snapshot) => match presenter::issue_payload(
+            &snapshot,
+            &issue_identifier,
+            &state.workspace_root,
+            Utc::now(),
+        ) {
             Some(payload) => Json(payload).into_response(),
             None => (
                 StatusCode::NOT_FOUND,

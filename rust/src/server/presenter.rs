@@ -1,9 +1,11 @@
+use std::path::Path;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{RefreshQueued, Snapshot};
-use crate::types::{RetryEntry, RunningEntry};
+use crate::types::{RetryEntry, RunningEntry, WorkspaceKey};
 
 pub fn state_payload(snapshot: &Snapshot, generated_at: DateTime<Utc>) -> StatePayload {
     StatePayload {
@@ -47,6 +49,7 @@ pub fn state_error_payload(code: &str, message: &str, generated_at: DateTime<Utc
 pub fn issue_payload(
     snapshot: &Snapshot,
     issue_identifier: &str,
+    workspace_root: &Path,
     generated_at: DateTime<Utc>,
 ) -> Option<IssuePayload> {
     let running = snapshot
@@ -76,7 +79,7 @@ pub fn issue_payload(
         workspace: WorkspacePayload {
             path: running
                 .map(|entry| entry.run_attempt.workspace_path.display().to_string())
-                .or_else(|| retry_workspace_path(issue_identifier))
+                .or_else(|| retry_workspace_path(workspace_root, issue_identifier))
                 .unwrap_or_default(),
             host: running
                 .and_then(|entry| entry.worker_host.clone())
@@ -324,8 +327,14 @@ fn issue_status(running: Option<&RunningEntry>, retry: Option<&RetryEntry>) -> &
     }
 }
 
-fn retry_workspace_path(_issue_identifier: &str) -> Option<String> {
-    None
+fn retry_workspace_path(workspace_root: &Path, issue_identifier: &str) -> Option<String> {
+    let workspace_key = WorkspaceKey::from_issue_identifier(issue_identifier);
+    Some(
+        workspace_root
+            .join(workspace_key.as_str())
+            .display()
+            .to_string(),
+    )
 }
 
 fn retry_workspace_host(_retry: Option<&RetryEntry>) -> Option<String> {

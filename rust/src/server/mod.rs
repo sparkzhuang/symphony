@@ -3,7 +3,7 @@ pub mod presenter;
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,8 +12,8 @@ use tokio::net::{lookup_host, TcpListener};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::WorkflowStore;
-use crate::types::OrchestratorState;
+use crate::config::{WorkflowConfig, WorkflowStore};
+use crate::types::{CodexTotals, OrchestratorState};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -67,6 +67,7 @@ pub struct ServerOptions {
     host: Option<String>,
     cli_port: Option<u16>,
     config_port: Option<u16>,
+    workspace_root: PathBuf,
     snapshot_timeout: Duration,
     snapshot_rx: watch::Receiver<SnapshotState>,
     refresh_tx: mpsc::Sender<()>,
@@ -78,6 +79,7 @@ impl ServerOptions {
             host: None,
             cli_port: None,
             config_port: None,
+            workspace_root: PathBuf::from("symphony_workspaces"),
             snapshot_timeout: DEFAULT_SNAPSHOT_TIMEOUT,
             snapshot_rx,
             refresh_tx,
@@ -96,6 +98,11 @@ impl ServerOptions {
 
     pub fn with_config_port(mut self, port: Option<u16>) -> Self {
         self.config_port = port;
+        self
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = workspace_root.into();
         self
     }
 
@@ -121,6 +128,7 @@ impl ServerOptions {
 pub(crate) struct AppState {
     pub(crate) snapshots: SnapshotSource,
     pub(crate) refresh: RefreshTrigger,
+    pub(crate) workspace_root: PathBuf,
     pub(crate) snapshot_timeout: Duration,
 }
 
@@ -129,6 +137,7 @@ impl AppState {
         Self {
             snapshots: SnapshotSource::new(options.snapshot_rx.clone()),
             refresh: RefreshTrigger::new(options.refresh_tx.clone()),
+            workspace_root: options.workspace_root.clone(),
             snapshot_timeout: options.snapshot_timeout,
         }
     }
@@ -278,6 +287,23 @@ pub fn runtime_channels(
     )
 }
 
+pub fn empty_snapshot(config: &WorkflowConfig) -> Snapshot {
+    Snapshot::new(
+        OrchestratorState {
+            poll_interval_ms: config.polling.interval_ms,
+            max_concurrent_agents: config.agent.max_concurrent_agents,
+            running: Default::default(),
+            claimed: Default::default(),
+            retry_attempts: Default::default(),
+            completed: Default::default(),
+            codex_totals: CodexTotals::default(),
+            codex_rate_limits: None,
+        },
+        Utc::now(),
+        0,
+    )
+}
+
 pub async fn bind_from_workflow(
     workflow_path: impl AsRef<Path>,
     cli_port: Option<u16>,
@@ -287,7 +313,8 @@ pub async fn bind_from_workflow(
     let workflow_path = workflow_path.as_ref();
     let workflow = WorkflowStore::load(workflow_path.to_path_buf())
         .with_context(|| format!("failed to load workflow from {}", workflow_path.display()))?;
-    let config_port = workflow.current().config.server.port;
+    let config = workflow.current().config.clone();
+    let config_port = config.server.port;
 
     if cli_port.or(config_port).is_none() {
         return Ok(None);
@@ -296,7 +323,8 @@ pub async fn bind_from_workflow(
     let server = HttpServer::bind(
         ServerOptions::new(snapshot_rx, refresh_tx)
             .with_cli_port(cli_port)
-            .with_config_port(config_port),
+            .with_config_port(config_port)
+            .with_workspace_root(config.workspace.root),
     )
     .await?;
 
