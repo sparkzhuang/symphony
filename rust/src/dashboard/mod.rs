@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use crate::types::OrchestratorState;
 
 pub mod terminal;
+pub mod web;
 
 /// Result of attempting to render a dashboard snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

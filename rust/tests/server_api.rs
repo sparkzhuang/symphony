@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde_json::Value;
 use symphony_rust::server::{HttpServer, ServerOptions, Snapshot, SnapshotState};
@@ -180,6 +181,129 @@ async fn state_endpoint_returns_running_retrying_totals_and_rate_limits() {
 
     assert_eq!((due_at - generated_at).num_seconds(), 80);
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn root_serves_embedded_dashboard_html_and_assets() {
+    let (server, _refresh_rx, _snapshot_tx) = spawn_server(
+        SnapshotState::Ready(Box::new(sample_state())),
+        Duration::from_millis(50),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+
+    let html = client
+        .get(format!("http://{}/", server.local_addr()))
+        .send()
+        .await
+        .expect("dashboard request should succeed");
+    assert_eq!(html.status(), StatusCode::OK);
+    assert_eq!(
+        html.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let html_body = html.text().await.expect("html body should be readable");
+    assert!(html_body.contains("Symphony Operations Dashboard"));
+    assert!(html_body.contains("/assets/dashboard.css"));
+    assert!(html_body.contains("/assets/dashboard.js"));
+    assert!(html_body.contains("issue-details"));
+
+    let css = client
+        .get(format!(
+            "http://{}/assets/dashboard.css",
+            server.local_addr()
+        ))
+        .send()
+        .await
+        .expect("css request should succeed");
+    assert_eq!(css.status(), StatusCode::OK);
+    assert_eq!(
+        css.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    assert!(css
+        .text()
+        .await
+        .expect("css body should be readable")
+        .contains(".dashboard-shell"));
+
+    let js = client
+        .get(format!(
+            "http://{}/assets/dashboard.js",
+            server.local_addr()
+        ))
+        .send()
+        .await
+        .expect("js request should succeed");
+    assert_eq!(js.status(), StatusCode::OK);
+    assert_eq!(
+        js.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/javascript; charset=utf-8")
+    );
+    let js_body = js.text().await.expect("js body should be readable");
+    assert!(js_body.contains("new EventSource('/api/v1/events')"));
+    assert!(js_body.contains("renderIssueDetails"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn sse_endpoint_streams_state_payload_updates() {
+    let initial_snapshot = sample_state();
+    let updated_snapshot = sample_state();
+    let updated_snapshot = Snapshot::new(
+        updated_snapshot.state.as_ref().clone(),
+        updated_snapshot.observed_at,
+        updated_snapshot.monotonic_now_ms + 5_000,
+    );
+
+    let (server, _refresh_rx, snapshot_tx) = spawn_server(
+        SnapshotState::Ready(Box::new(initial_snapshot)),
+        Duration::from_millis(50),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let mut response = client
+        .get(format!("http://{}/api/v1/events", server.local_addr()))
+        .send()
+        .await
+        .expect("sse request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    snapshot_tx
+        .send(SnapshotState::Ready(Box::new(updated_snapshot)))
+        .expect("snapshot update should be published");
+
+    let first_chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk())
+        .await
+        .expect("sse chunk should arrive")
+        .expect("chunk read should succeed")
+        .expect("sse stream should produce a chunk");
+    let first_event = String::from_utf8(first_chunk.to_vec()).expect("chunk should be utf-8");
+
+    assert!(first_event.contains("event: state"));
+    assert!(first_event.contains("\"issue_identifier\":\"SPA-17\""));
+    assert!(first_event.contains("\"retrying\":1"));
+    assert!(first_event.contains("\"total_tokens\":7400"));
+
+    drop(response);
     server.shutdown().await;
 }
 
