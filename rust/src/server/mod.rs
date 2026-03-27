@@ -1,4 +1,5 @@
 pub mod api;
+pub mod dashboard;
 pub mod presenter;
 
 use std::io;
@@ -153,6 +154,10 @@ impl SnapshotSource {
         Self { receiver }
     }
 
+    pub(crate) fn subscribe(&self) -> watch::Receiver<SnapshotState> {
+        self.receiver.clone()
+    }
+
     pub(crate) async fn snapshot(&self, timeout: Duration) -> Result<Snapshot, SnapshotError> {
         let mut receiver = self.receiver.clone();
 
@@ -219,7 +224,7 @@ impl HttpServer {
         let local_addr = listener
             .local_addr()
             .context("failed to read bound HTTP server address")?;
-        let app = api::router(AppState::new(&options));
+        let app = dashboard::attach(api::router()).with_state(AppState::new(&options));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let task = tokio::spawn(async move {

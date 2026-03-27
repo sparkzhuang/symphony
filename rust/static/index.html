@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Symphony Operations Dashboard</title>
+    <link rel="stylesheet" href="/assets/dashboard.css" />
+  </head>
+  <body>
+    <main class="dashboard-shell">
+      <section class="hero-card">
+        <div>
+          <p class="eyebrow">Symphony Observability</p>
+          <h1>Symphony Operations Dashboard</h1>
+          <p class="hero-copy">
+            Live orchestration status, retry pressure, and issue-level detail without a frontend
+            build step.
+          </p>
+        </div>
+        <div class="connection-panel">
+          <span class="status-pill" id="connection-status">Connecting</span>
+          <p class="status-copy" id="connection-copy">Waiting for the first snapshot.</p>
+        </div>
+      </section>
+
+      <section class="metric-grid" id="metric-grid">
+        <article class="metric-card">
+          <p class="metric-label">Running</p>
+          <p class="metric-value" data-metric="running">0</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">Retrying</p>
+          <p class="metric-value" data-metric="retrying">0</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">Total tokens</p>
+          <p class="metric-value" data-metric="total_tokens">0</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">Runtime</p>
+          <p class="metric-value" data-metric="runtime">0s</p>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <section class="panel-card">
+          <div class="panel-header">
+            <div>
+              <p class="panel-eyebrow">Live work</p>
+              <h2>Running sessions</h2>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Issue</th>
+                  <th>State</th>
+                  <th>Session</th>
+                  <th>Runtime / turns</th>
+                  <th>Last update</th>
+                  <th>Tokens</th>
+                </tr>
+              </thead>
+              <tbody id="running-body">
+                <tr class="empty-row">
+                  <td colspan="6">No active sessions.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="panel-card issue-details" id="issue-details">
+          <div class="panel-header">
+            <div>
+              <p class="panel-eyebrow">Selected issue</p>
+              <h2>Issue details</h2>
+            </div>
+          </div>
+          <div class="detail-body" id="issue-details-body">
+            <p>Select a running or retrying issue to inspect its workspace, attempts, and recent events.</p>
+          </div>
+        </aside>
+      </section>
+
+      <section class="panel-card">
+        <div class="panel-header">
+          <div>
+            <p class="panel-eyebrow">Backoff</p>
+            <h2>Retry queue</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Issue</th>
+                <th>Attempt</th>
+                <th>Due at</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody id="retry-body">
+              <tr class="empty-row">
+                <td colspan="4">No issues are currently backing off.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/assets/dashboard.js"></script>
+  </body>
+</html>

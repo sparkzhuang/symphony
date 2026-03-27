@@ -9,7 +9,7 @@ use serde_json::json;
 use super::presenter;
 use super::{AppState, RefreshError, SnapshotError};
 
-pub(crate) fn router(state: AppState) -> Router {
+pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/state", get(state_snapshot))
@@ -17,7 +17,6 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/v1/{issue_identifier}", get(issue_detail))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
-        .with_state(state)
 }
 
 async fn healthz() -> impl IntoResponse {
